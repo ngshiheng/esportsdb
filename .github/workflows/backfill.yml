@@ -6,7 +6,7 @@ on:
 
 # Holds the shared DB artifact lock for the full duration.
 concurrency:
-    group: esportsdb-artifact
+    group: esports-db-artifact
     cancel-in-progress: false
 
 jobs:
@@ -19,22 +19,26 @@ jobs:
             contents: read
 
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v6
 
-            - uses: astral-sh/setup-uv@v5
+            - uses: astral-sh/setup-uv@v6
 
             - name: Get latest artifact run id
+              env:
+                  GH_TOKEN: ${{ github.token }}
               run: |
-                  ARTIFACT_RUN_ID=$(curl -s \
-                    -H "Authorization: Bearer ${{ github.token }}" \
-                    "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=esportsdb&per_page=1" \
-                    | jq '.artifacts[0].workflow_run.id // empty')
-                  echo "artifact_run_id=$ARTIFACT_RUN_ID" >> $GITHUB_ENV
+                  set -euo pipefail
+                  run_id=$(gh api \
+                    "repos/${{ github.repository }}/actions/artifacts?name=esports-db&per_page=1" \
+                    --jq '.artifacts[0].workflow_run.id // empty')
+                  if [[ -n "$run_id" ]]; then
+                    echo "artifact_run_id=$run_id" >> "$GITHUB_ENV"
+                  fi
 
             - name: Download previous DB artifact
               uses: actions/download-artifact@v4
               with:
-                  name: esportsdb
+                  name: esports-db
                   path: ./data/
                   run-id: ${{ env.artifact_run_id }}
                   github-token: ${{ github.token }}
@@ -61,7 +65,7 @@ jobs:
             - name: Upload updated DB artifact
               uses: actions/upload-artifact@v4
               with:
-                  name: esportsdb
+                  name: esports-db
                   path: data/esports.db
                   if-no-files-found: error
                   retention-days: 90
