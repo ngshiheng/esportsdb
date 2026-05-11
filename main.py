@@ -68,6 +68,17 @@ ALL_RESOURCES = (
     "players",
 )
 
+# FK dependency graph: if you request a child resource without its parents in
+# the same run, the parent tables must already be populated in the database.
+# scrape-slow handles parents; scrape-fast handles matches only.
+RESOURCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "leagues": ("videogames",),
+    "series": ("videogames", "leagues"),
+    "tournaments": ("videogames", "leagues", "series"),
+    "matches": ("videogames", "leagues", "series", "tournaments"),
+    "players": ("videogames", "teams"),
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -526,10 +537,31 @@ def scrape_resource(
     total = 0
     for page in client.fetch_all(endpoint):
         for record in page:
-            db.upsert(table, to_row(record))
+            row = to_row(record)
+            try:
+                db.upsert(table, row)
+            except sqlite3.IntegrityError as exc:
+                log.error(
+                    "FK violation upserting into '%s' (record id=%s): %s\n  row: %s",
+                    table,
+                    record.get("id"),
+                    exc,
+                    row,
+                )
+                raise
             if extra_rows_fn:
                 for extra_row in extra_rows_fn(record):
-                    db.upsert("match_opponents", extra_row)
+                    try:
+                        db.upsert("match_opponents", extra_row)
+                    except sqlite3.IntegrityError as exc:
+                        log.error(
+                            "FK violation upserting into 'match_opponents' "
+                            "(match_id=%s): %s\n  row: %s",
+                            extra_row.get("match_id"),
+                            exc,
+                            extra_row,
+                        )
+                        raise
         db.commit()
         total += len(page)
     return total
@@ -611,6 +643,22 @@ def _build_config(args: argparse.Namespace) -> ScraperConfig:
     valid = [r for r in requested if r in ALL_RESOURCES]
     if not valid:
         raise SystemExit("Error: no valid resources specified.")
+
+    # Warn when child resources are requested without their parents in this run.
+    # Parent tables must already be populated in the DB (e.g. from a prior slow scrape).
+    requested_set = set(valid)
+    for resource in valid:
+        missing_parents = [
+            p for p in RESOURCE_DEPENDENCIES.get(resource, ()) if p not in requested_set
+        ]
+        if missing_parents:
+            log.warning(
+                "Resource '%s' has FK dependencies on %s which are NOT in this run. "
+                "Those tables must already be populated in the database, "
+                "otherwise you will hit FOREIGN KEY constraint errors.",
+                resource,
+                missing_parents,
+            )
 
     since: str | None = None
     if args.since:

@@ -34,7 +34,21 @@ jobs:
                   path: ./data/
                   run-id: ${{ env.artifact_run_id }}
                   github-token: ${{ secrets.GH_PAT }}
-              continue-on-error: true
+              # No continue-on-error: the fast job MUST start from a pre-populated DB.
+              # matches has FK dependencies on leagues, series, tournaments, videogames —
+              # all populated by scrape-slow. Without the artifact those tables are empty
+              # and every upsert will raise a FOREIGN KEY constraint error.
+
+            - name: Validate parent tables are populated
+              run: |
+                  for table in videogames leagues series tournaments; do
+                    COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM $table;")
+                    echo "$table row count: $COUNT"
+                    if [ "$COUNT" -lt 1 ]; then
+                      echo "ERROR: $table is empty. Run scrape-slow first to populate parent tables."
+                      exit 1
+                    fi
+                  done
 
             - name: Scrape incremental matches
               env:
