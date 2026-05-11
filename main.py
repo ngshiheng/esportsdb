@@ -2,6 +2,8 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#   "backoff>=2.2",
+#   "hishel>=1.2",
 #   "httpx>=0.27",
 # ]
 # ///
@@ -11,12 +13,25 @@ PandaScore periodic scraper — populates a local SQLite database.
 Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
-    ./pandascore_scraper.py
-    ./pandascore_scraper.py --db /data/pandascore.db
-    ./pandascore_scraper.py --resources leagues,teams,players
+    ./main.py
+    ./main.py --db /data/pandascore.db
+    ./main.py --resources leagues,teams,players
 
-Cron example (every 6 hours):
-    0 */6 * * * PANDASCORE_API_KEY=sk-xxx /path/to/pandascore_scraper.py
+    # Incremental matches only (last 48 hours):
+    ./main.py --resources matches --since 48h
+
+    # Historical backfill (one-time, safe to Ctrl-C and re-run):
+    ./main.py --resources matches
+
+Cron examples:
+    # Slow tables — full rescrape once daily (~304 req, ~20 min)
+    0 2 * * *   PANDASCORE_API_KEY=sk-xxx ./main.py --resources videogames,leagues,series,tournaments,teams,players
+
+    # Fast table — incremental every 2 hours (~5 req/run)
+    0 */2 * * * PANDASCORE_API_KEY=sk-xxx ./main.py --resources matches --since 48h
+
+Rate budget: default --page-delay of 4.0s keeps throughput at ~900 req/hr (limit: 1,000/hr).
+HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run immediately.
 """
 
 from __future__ import annotations
@@ -30,7 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generator
 
+import backoff
 import httpx
+from hishel import SyncSqliteStorage
+from hishel.httpx import SyncCacheClient
 
 PANDASCORE_BASE_URL = "https://api.pandascore.co"
 DEFAULT_PAGE_SIZE = 100
@@ -38,7 +56,7 @@ DEFAULT_DB_PATH = Path("pandascore.db")
 HTTP_TOO_MANY_REQUESTS = 429
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2.0
-INTER_PAGE_DELAY_SECONDS = 0.25
+INTER_PAGE_DELAY_SECONDS = 4.0  # keeps throughput ~900 req/hr, under the 1k/hr limit
 
 ALL_RESOURCES = (
     "videogames",
@@ -58,6 +76,35 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+class RateLimitError(Exception):
+    """Raised when PandaScore returns HTTP 429 so backoff can retry it."""
+
+
+def _on_backoff(details: dict) -> None:
+    exc = details["exception"]
+    endpoint = details["args"][1]
+    page_number = details["args"][2]
+    wait = details["wait"]
+    tries = details["tries"]
+    if isinstance(exc, RateLimitError):
+        log.warning(
+            "Rate limited on /%s page %d (attempt %d) — backing off %.1fs.",
+            endpoint,
+            page_number,
+            tries,
+            wait,
+        )
+    else:
+        log.warning(
+            "Request error on /%s page %d (attempt %d) — backing off %.1fs: %s",
+            endpoint,
+            page_number,
+            tries,
+            wait,
+            exc,
+        )
+
+
 @dataclass(frozen=True)
 class ScraperConfig:
     """Runtime settings for one scraper run.
@@ -67,12 +114,17 @@ class ScraperConfig:
         db_path: Filesystem path for the SQLite database.
         resources: Ordered tuple of resource names to scrape.
         page_size: Records requested per API page.
+        since: ISO-8601 datetime string; when set, matches are filtered to
+               ``begin_at >= since``.  None means full history.
+        page_delay: Seconds to sleep between paginated requests.
     """
 
     api_key: str
     db_path: Path
     resources: tuple[str, ...]
     page_size: int
+    since: str | None = None
+    page_delay: float = INTER_PAGE_DELAY_SECONDS
 
 
 @dataclass
@@ -82,63 +134,63 @@ class PandaScoreClient:
     Attributes:
         api_key: Bearer token used for every request.
         page_size: Records per page.
+        since: Optional ISO-8601 lower-bound filter applied to ``matches``
+               endpoint only (``filter[begin_at][gte]``).
+        page_delay: Seconds to sleep between pages.
     """
 
     api_key: str
     page_size: int = DEFAULT_PAGE_SIZE
+    since: str | None = None
+    page_delay: float = INTER_PAGE_DELAY_SECONDS
+    _http: SyncCacheClient = field(init=False, repr=False)
 
-    def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.api_key}"}
+    def __post_init__(self) -> None:
+        storage = SyncSqliteStorage(default_ttl=7200)
+        self._http = SyncCacheClient(
+            storage=storage,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
 
-    def _page_params(self, page_number: int) -> dict[str, Any]:
-        return {"page[number]": page_number, "page[size]": self.page_size, "sort": "id"}
+    def close(self) -> None:
+        self._http.close()
 
+    def _page_params(self, page_number: int, endpoint: str) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "page[number]": page_number,
+            "page[size]": self.page_size,
+            "sort": "id",
+        }
+        if self.since and endpoint == "matches":
+            params["filter[begin_at][gte]"] = self.since
+        return params
+
+    @backoff.on_exception(
+        backoff.expo,
+        (httpx.RequestError, RateLimitError),
+        max_tries=MAX_RETRIES,
+        factor=INITIAL_BACKOFF_SECONDS,
+        jitter=None,
+        on_backoff=_on_backoff,
+        logger=None,
+    )
     def _fetch_page_with_retry(
         self, endpoint: str, page_number: int
     ) -> list[dict[str, Any]]:
         url = f"{PANDASCORE_BASE_URL}/{endpoint}"
-        backoff = INITIAL_BACKOFF_SECONDS
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = httpx.get(
-                    url,
-                    headers=self._auth_headers(),
-                    params=self._page_params(page_number),
-                    timeout=30.0,
-                )
-                if response.status_code == HTTP_TOO_MANY_REQUESTS:
-                    log.warning(
-                        "Rate limited on /%s page %d — backing off %.1fs.",
-                        endpoint,
-                        page_number,
-                        backoff,
-                    )
-                    time.sleep(backoff)
-                    backoff *= 2
-                    continue
-
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.HTTPStatusError as exc:
-                log.error("HTTP %d on /%s: %s", exc.response.status_code, endpoint, exc)
-                raise
-
-            except httpx.RequestError as exc:
-                log.warning(
-                    "Request error on /%s (attempt %d/%d): %s",
-                    endpoint,
-                    attempt,
-                    MAX_RETRIES,
-                    exc,
-                )
-                if attempt == MAX_RETRIES:
-                    raise
-                time.sleep(backoff)
-                backoff *= 2
-
-        return []
+        response = self._http.get(
+            url,
+            params=self._page_params(page_number, endpoint),
+            timeout=30.0,
+        )
+        if response.status_code == HTTP_TOO_MANY_REQUESTS:
+            raise RateLimitError(f"429 on /{endpoint} page {page_number}")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            log.error("HTTP %d on /%s: %s", exc.response.status_code, endpoint, exc)
+            raise
+        return response.json()
 
     def fetch_all(self, endpoint: str) -> Generator[list[dict[str, Any]], None, None]:
         """Yield one page at a time; caller commits after each batch."""
@@ -151,7 +203,7 @@ class PandaScoreClient:
             if len(records) < self.page_size:
                 break
             page_number += 1
-            time.sleep(INTER_PAGE_DELAY_SECONDS)
+            time.sleep(self.page_delay)
 
 
 SCHEMA_DDL: tuple[str, ...] = (
@@ -499,11 +551,20 @@ RESOURCE_CONFIG: dict[str, dict[str, Any]] = {
 
 
 def run_scrape(config: ScraperConfig) -> None:
-    client = PandaScoreClient(api_key=config.api_key, page_size=config.page_size)
+    client = PandaScoreClient(
+        api_key=config.api_key,
+        page_size=config.page_size,
+        since=config.since,
+        page_delay=config.page_delay,
+    )
     db = Database(path=config.db_path)
     db.ensure_schema()
 
-    log.info("Starting scrape: %s", list(config.resources))
+    log.info(
+        "Starting scrape: %s%s",
+        list(config.resources),
+        f" (since {config.since})" if config.since else "",
+    )
     started_at = time.monotonic()
 
     try:
@@ -516,9 +577,25 @@ def run_scrape(config: ScraperConfig) -> None:
             count = scrape_resource(client, db, endpoint=resource, **cfg)
             log.info("    → %d records upserted.", count)
     finally:
+        client.close()
         db.close()
 
     log.info("Scrape complete in %.1fs.", time.monotonic() - started_at)
+
+
+def _parse_since(value: str) -> str:
+    """Convert a human-friendly shorthand (e.g. ``48h``, ``7d``) to an
+    ISO-8601 UTC datetime string, or return the value unchanged if it is
+    already an ISO-8601 string."""
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    m = re.fullmatch(r"(\d+)([hd])", value.strip())
+    if m:
+        amount, unit = int(m.group(1)), m.group(2)
+        delta = timedelta(hours=amount) if unit == "h" else timedelta(days=amount)
+        return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value
 
 
 def _build_config(args: argparse.Namespace) -> ScraperConfig:
@@ -535,11 +612,18 @@ def _build_config(args: argparse.Namespace) -> ScraperConfig:
     if not valid:
         raise SystemExit("Error: no valid resources specified.")
 
+    since: str | None = None
+    if args.since:
+        since = _parse_since(args.since)
+        log.info("Incremental mode: filtering matches to begin_at >= %s", since)
+
     return ScraperConfig(
         api_key=api_key,
         db_path=Path(args.db),
         resources=tuple(valid),
         page_size=args.page_size,
+        since=since,
+        page_delay=args.page_delay,
     )
 
 
@@ -566,6 +650,23 @@ def main() -> None:
         default=DEFAULT_PAGE_SIZE,
         metavar="N",
         help="Records per API page.",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        metavar="WHEN",
+        help=(
+            "Only fetch matches with begin_at >= WHEN. "
+            "Accepts ISO-8601 (2025-01-01T00:00:00Z) or shorthand: 48h, 7d. "
+            "Ignored for non-match resources."
+        ),
+    )
+    parser.add_argument(
+        "--page-delay",
+        type=float,
+        default=INTER_PAGE_DELAY_SECONDS,
+        metavar="SECS",
+        help="Seconds between paginated requests. Default keeps throughput ~900 req/hr.",
     )
 
     run_scrape(_build_config(parser.parse_args()))
