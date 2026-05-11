@@ -1,6 +1,6 @@
 # esportsdb
 
-A self-contained PandaScore scraper that builds and maintains a SQLite database of esports data (videogames, leagues, series, tournaments, matches, teams, players). The DB is persisted as a GitHub Actions artifact and kept fresh via a three-tier CI pipeline. A Datasette Docker image is published on every daily run.
+A self-contained PandaScore scraper that builds and maintains a SQLite database of esports data (videogames, leagues, series, tournaments, matches, teams, players). The DB is persisted as a GitHub Actions artifact and kept fresh via a three-workflow CI pipeline.
 
 ## How it works
 
@@ -9,41 +9,33 @@ flowchart TD
     PS[("PandaScore API<br>api.pandascore.co")]
 
     subgraph CI ["GitHub Actions (serialised via concurrency group)"]
-        W["scrape-weekly.yml<br>Sundays 00:00 UTC<br>static tables"]
-        S["scrape-slow.yml<br>Daily 02:00 UTC<br>historical tables + Docker build"]
+        S["scrape-slow.yml<br>Daily 02:00 UTC<br>all non-match tables"]
         F["scrape-fast.yml<br>Every 2 hours<br>upcoming / live / recent matches"]
         B["scrape-backfill.yml<br>workflow_dispatch only<br>full historical matches sweep"]
     end
 
     ART[("GitHub Artifact<br>esports.db")]
-    DH["Docker Hub<br>datasette image"]
 
-    PS -->|"paginated REST<br>100 records/page<br>4s inter-page delay"| W
-    PS --> S
+    PS -->|"paginated REST<br>100 records/page<br>4s inter-page delay"| S
     PS --> F
     PS --> B
 
-    ART -->|"download at job start"| W
     ART -->|"download at job start"| S
     ART -->|"download at job start"| F
     ART -->|"download at job start"| B
 
-    W -->|"upload on success"| ART
     S -->|"upload on success"| ART
     F -->|"upload on success"| ART
     B -->|"upload on success"| ART
-
-    S -->|"docker build & push"| DH
 ```
 
-All four workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex — only one job holds the artifact lock at a time; others queue and wait.
+All three workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex — only one job holds the artifact lock at a time; others queue and wait.
 
 ## CI Workflows
 
 | Workflow              | Schedule                 | Resources                                                            | Purpose                                                              |
 | --------------------- | ------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `scrape-weekly.yml`   | Sundays 00:00 UTC        | `videogames`, `leagues`                                              | Full rescrape of near-static reference tables (~1,300 rows, ~1 min)  |
-| `scrape-slow.yml`     | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full historical rescrape of all non-match tables + Docker build      |
+| `scrape-slow.yml`     | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match tables                          |
 | `scrape-fast.yml`     | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h`                     | Keep upcoming/live data fresh; catch recently finalised match scores |
 | `scrape-backfill.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
 
@@ -175,8 +167,6 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 | -------------------- | ------------------------------------------------------------- |
 | `PANDASCORE_API_KEY` | All scrape jobs                                               |
 | `GH_PAT`             | Artifact download across workflow runs (needs `actions:read`) |
-| `DOCKERHUB_USERNAME` | `scrape-slow` Docker build                                    |
-| `DOCKERHUB_TOKEN`    | `scrape-slow` Docker build                                    |
 
 ## Local usage
 
