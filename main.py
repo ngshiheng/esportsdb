@@ -56,7 +56,9 @@ DEFAULT_DB_PATH = Path("data/esports.db")
 HTTP_TOO_MANY_REQUESTS = 429
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2.0
-INTER_PAGE_DELAY_SECONDS = 4.0  # keeps throughput ~900 req/hr, under the 1k/hr limit
+INTER_PAGE_DELAY_SECONDS = (
+    5.0  # keeps throughput ~720 req/hr, well under the 1k/hr limit
+)
 
 ALL_RESOURCES = (
     "videogames",
@@ -565,39 +567,46 @@ def scrape_resource(
                        from the same record (e.g. match_opponent_rows).
     """
     total = 0
-    for page in client.fetch_all(endpoint):
-        for record in page:
-            row = to_row(record)
-            try:
-                db.upsert(table, row)
-            except sqlite3.IntegrityError as exc:
-                log.error(
-                    "FK violation upserting into '%s' (record id=%s): %s\n  row: %s",
-                    table,
-                    record.get("id"),
-                    exc,
-                    row,
-                )
-                if skip_fk_errors:
-                    continue
-                raise
-            if extra_rows_fn:
-                for extra_row in extra_rows_fn(record):
-                    try:
-                        db.upsert("match_opponents", extra_row)
-                    except sqlite3.IntegrityError as exc:
-                        log.error(
-                            "FK violation upserting into 'match_opponents' "
-                            "(match_id=%s): %s\n  row: %s",
-                            extra_row.get("match_id"),
-                            exc,
-                            extra_row,
-                        )
-                        if skip_fk_errors:
-                            continue
-                        raise
-        db.commit()
-        total += len(page)
+    try:
+        for page in client.fetch_all(endpoint):
+            for record in page:
+                row = to_row(record)
+                try:
+                    db.upsert(table, row)
+                except sqlite3.IntegrityError as exc:
+                    log.error(
+                        "FK violation upserting into '%s' (record id=%s): %s\n  row: %s",
+                        table,
+                        record.get("id"),
+                        exc,
+                        row,
+                    )
+                    if skip_fk_errors:
+                        continue
+                    raise
+                if extra_rows_fn:
+                    for extra_row in extra_rows_fn(record):
+                        try:
+                            db.upsert("match_opponents", extra_row)
+                        except sqlite3.IntegrityError as exc:
+                            log.error(
+                                "FK violation upserting into 'match_opponents' "
+                                "(match_id=%s): %s\n  row: %s",
+                                extra_row.get("match_id"),
+                                exc,
+                                extra_row,
+                            )
+                            if skip_fk_errors:
+                                continue
+                            raise
+            db.commit()
+            total += len(page)
+    except RateLimitError:
+        log.warning(
+            "Rate limit exhausted on /%s after %d records — saving partial progress.",
+            endpoint,
+            total,
+        )
     return total
 
 

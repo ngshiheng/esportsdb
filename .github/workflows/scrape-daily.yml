@@ -54,6 +54,8 @@ jobs:
               continue-on-error: true
 
             - name: Scrape daily resources
+              id: scrape
+              continue-on-error: true
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
@@ -62,7 +64,9 @@ jobs:
                     --resources videogames,leagues,series,tournaments,teams,players
 
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
+            # Runs even when scrape was rate-limited so partial progress is preserved.
             - name: Validate DB
+              if: always()
               run: |
                   COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM players;")
                   echo "players row count: $COUNT"
@@ -72,6 +76,7 @@ jobs:
                   fi
 
             - name: Upload updated DB artifact
+              if: always()
               uses: actions/upload-artifact@v4
               with:
                   name: esports-db
