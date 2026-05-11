@@ -11,3 +11,9 @@ wheels/
 
 # SQLite
 *.db*
+
+# Hishel HTTP cache
+.cache/
+
+# Scraper data directory (DB is persisted via GitHub Actions artifacts)
+data/*.db

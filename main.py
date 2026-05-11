@@ -14,7 +14,7 @@ Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
     ./main.py
-    ./main.py --db /data/pandascore.db
+    ./main.py --db /data/esports.db
     ./main.py --resources leagues,teams,players
 
     # Incremental matches only (last 48 hours):
@@ -52,7 +52,7 @@ from hishel.httpx import SyncCacheClient
 
 PANDASCORE_BASE_URL = "https://api.pandascore.co"
 DEFAULT_PAGE_SIZE = 100
-DEFAULT_DB_PATH = Path("pandascore.db")
+DEFAULT_DB_PATH = Path("data/esports.db")
 HTTP_TOO_MANY_REQUESTS = 429
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2.0

@@ -1,0 +1,65 @@
+name: Scrape (incremental matches)
+
+on:
+    schedule:
+        - cron: "0 */2 * * *" # Every 2 hours
+    workflow_dispatch:
+
+# Same group as scrape-slow — serialises all DB artifact access.
+concurrency:
+    group: esportsdb-artifact
+    cancel-in-progress: false
+
+jobs:
+    scrape:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: astral-sh/setup-uv@v5
+
+            - name: Get latest artifact run id
+              run: |
+                  ARTIFACT_RUN_ID=$(curl -s \
+                    -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+                    "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=esportsdb&per_page=1" \
+                    | jq '.artifacts[0].workflow_run.id')
+                  echo "artifact_run_id=$ARTIFACT_RUN_ID" >> $GITHUB_ENV
+
+            - name: Download previous DB artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: esportsdb
+                  path: ./data/
+                  run-id: ${{ env.artifact_run_id }}
+                  github-token: ${{ secrets.GH_PAT }}
+              continue-on-error: true
+
+            - name: Scrape incremental matches
+              env:
+                  PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
+              run: |
+                  uv run main.py \
+                    --db data/esports.db \
+                    --resources matches \
+                    --since 48h
+
+            # Matches table must be non-empty — a fully empty DB indicates
+            # the scraper failed silently or the DB was not downloaded correctly.
+            - name: Validate DB
+              run: |
+                  COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM matches;")
+                  echo "matches row count: $COUNT"
+                  if [ "$COUNT" -lt 1 ]; then
+                    echo "ERROR: matches table is empty. Aborting upload."
+                    exit 1
+                  fi
+
+            - name: Upload updated DB artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: esportsdb
+                  path: data/esports.db
+                  if-no-files-found: error
+                  retention-days: 90

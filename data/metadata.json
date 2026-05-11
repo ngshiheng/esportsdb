@@ -1,0 +1,64 @@
+{
+    "title": "Esports DB",
+    "description": "PandaScore esports data — matches, teams, players, tournaments, leagues.",
+    "license": "ODbL",
+    "license_url": "https://opendatacommons.org/licenses/odbl/",
+    "source": "PandaScore API",
+    "source_url": "https://pandascore.co",
+    "databases": {
+        "esports": {
+            "queries": {
+                "game_overview": {
+                    "title": "Game Coverage Overview",
+                    "description": "How many leagues, series and tournaments does each game have? A quick snapshot of coverage across all titles.",
+                    "sql": "SELECT v.name AS game, v.slug, COUNT(DISTINCT l.id) AS leagues, COUNT(DISTINCT s.id) AS series, COUNT(DISTINCT t.id) AS tournaments FROM videogames v LEFT JOIN leagues l ON l.videogame_id = v.id LEFT JOIN series s ON s.videogame_id = v.id LEFT JOIN tournaments t ON t.videogame_id = v.id GROUP BY v.id ORDER BY leagues DESC"
+                },
+                "leagues_by_game": {
+                    "title": "Leagues for a Game",
+                    "description": "Browse every league for a specific title. Try: Counter-Strike, Valorant, Dota 2, LoL, Overwatch, Rocket League, PUBG.",
+                    "sql": "SELECT l.name AS league, l.slug, l.url, COUNT(DISTINCT s.id) AS series_count FROM leagues l JOIN videogames v ON v.id = l.videogame_id LEFT JOIN series s ON s.league_id = l.id WHERE v.name LIKE '%' || :game || '%' GROUP BY l.id ORDER BY series_count DESC"
+                },
+                "top_leagues_by_activity": {
+                    "title": "Most Active Leagues",
+                    "description": "Which leagues have the most series? A ranking of the busiest competitive circuits across all games.",
+                    "sql": "SELECT l.name AS league, v.name AS game, COUNT(s.id) AS series_count FROM leagues l JOIN videogames v ON v.id = l.videogame_id JOIN series s ON s.league_id = l.id GROUP BY l.id ORDER BY series_count DESC LIMIT 25"
+                },
+                "premier_tournaments": {
+                    "title": "Premier (S-Tier) Tournaments",
+                    "description": "The most prestigious events in esports — S-tier tournaments only. These are the Majors, Worlds, and Grand Finals.",
+                    "sql": "SELECT t.name, t.full_name, v.name AS game, l.name AS league, t.begin_at, t.end_at, t.prizepool FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN series s ON s.id = t.serie_id JOIN leagues l ON l.id = t.league_id WHERE t.tier = 's' ORDER BY t.begin_at DESC"
+                },
+                "tournaments_with_prize_pools": {
+                    "title": "Tournaments with Prize Pools",
+                    "description": "Events that had prize money on the line. Shows the purse alongside the game and league context.",
+                    "sql": "SELECT t.name, t.full_name, v.name AS game, l.name AS league, t.prizepool, t.tier, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.prizepool IS NOT NULL AND t.prizepool != '' ORDER BY t.begin_at DESC"
+                },
+                "series_by_year": {
+                    "title": "Competitive Seasons by Year",
+                    "description": "All series (competitive seasons) for a given year. Shows which leagues were active and in which games.",
+                    "sql": "SELECT s.full_name AS series, v.name AS game, l.name AS league, s.season, s.begin_at, s.end_at FROM series s JOIN videogames v ON v.id = s.videogame_id JOIN leagues l ON l.id = s.league_id WHERE s.year = cast(:year as integer) ORDER BY v.name, l.name, s.begin_at"
+                },
+                "league_history": {
+                    "title": "League Season History",
+                    "description": "All series and tournaments ever run under a specific league. Enter a league name (or part of it) to trace its full history.",
+                    "sql": "SELECT s.year, s.full_name AS series, s.season, s.begin_at, s.end_at, COUNT(t.id) AS tournaments FROM series s JOIN leagues l ON l.id = s.league_id LEFT JOIN tournaments t ON t.serie_id = s.id WHERE l.name LIKE '%' || :league || '%' GROUP BY s.id ORDER BY s.year DESC, s.begin_at DESC"
+                },
+                "tournament_tier_breakdown": {
+                    "title": "Tournament Tiers by Game",
+                    "description": "How many S/A/B/C/D-tier events exist per game? Tiers reflect prestige: S = premier, A = top, B = mid, C/D = regional/open.",
+                    "sql": "SELECT v.name AS game, t.tier, COUNT(*) AS tournament_count FROM tournaments t JOIN videogames v ON v.id = t.videogame_id WHERE t.tier IS NOT NULL GROUP BY v.id, t.tier ORDER BY v.name, CASE t.tier WHEN 's' THEN 1 WHEN 'a' THEN 2 WHEN 'b' THEN 3 WHEN 'c' THEN 4 WHEN 'd' THEN 5 ELSE 6 END"
+                },
+                "search_leagues": {
+                    "title": "Search Leagues",
+                    "description": "Find a league by name — useful for looking up circuits like ESL, IEM, VCT, DreamLeague, PGL, BLAST, etc.",
+                    "sql": "SELECT l.name AS league, v.name AS game, l.slug, l.url, COUNT(DISTINCT s.id) AS series_count FROM leagues l JOIN videogames v ON v.id = l.videogame_id LEFT JOIN series s ON s.league_id = l.id WHERE l.name LIKE '%' || :search || '%' GROUP BY l.id ORDER BY series_count DESC"
+                },
+                "recent_tournaments": {
+                    "title": "Most Recent Tournaments",
+                    "description": "The latest completed tournaments across all games, sorted by end date.",
+                    "sql": "SELECT t.name, t.full_name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN series s ON s.id = t.serie_id JOIN leagues l ON l.id = t.league_id WHERE t.end_at IS NOT NULL ORDER BY t.end_at DESC LIMIT 50"
+                }
+            }
+        }
+    }
+}
