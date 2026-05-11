@@ -40,12 +40,12 @@ All four workflows share the **`esportsdb-artifact` concurrency group** (`cancel
 
 ## CI Workflows
 
-| Workflow              | Schedule                 | Resources                                        | Purpose                                                              |
-| --------------------- | ------------------------ | ------------------------------------------------ | -------------------------------------------------------------------- |
-| `scrape-weekly.yml`   | Sundays 00:00 UTC        | `videogames`, `leagues`                          | Full rescrape of near-static reference tables (~1,300 rows, ~1 min)  |
-| `scrape-slow.yml`     | Daily 02:00 UTC          | `series`, `tournaments`, `teams`, `players`      | Full historical rescrape of slow-changing tables + Docker build      |
-| `scrape-fast.yml`     | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h` | Keep upcoming/live data fresh; catch recently finalised match scores |
-| `scrape-backfill.yml` | `workflow_dispatch` only | `matches` (no filter)                            | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
+| Workflow              | Schedule                 | Resources                                                            | Purpose                                                              |
+| --------------------- | ------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `scrape-weekly.yml`   | Sundays 00:00 UTC        | `videogames`, `leagues`                                              | Full rescrape of near-static reference tables (~1,300 rows, ~1 min)  |
+| `scrape-slow.yml`     | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full historical rescrape of all non-match tables + Docker build      |
+| `scrape-fast.yml`     | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h`                     | Keep upcoming/live data fresh; catch recently finalised match scores |
+| `scrape-backfill.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
 
 ### scrape-fast detail
 
@@ -210,7 +210,6 @@ PANDASCORE_API_KEY=sk-xxx uv run main.py --resources matches,series,tournaments 
 
 ## Go-live order
 
-1. Run `scrape-weekly` once — populates `videogames` and `leagues`
-2. Run `scrape-slow` once — populates `series`, `tournaments`, `teams`, `players`
-3. Trigger `scrape-backfill` manually — full historical matches sweep (~2.5 h, holds the artifact lock; other jobs queue behind it automatically)
-4. Enable scheduled runs — `scrape-fast` and `scrape-slow` maintain the DB from here on
+1. Run `scrape-slow` once — populates `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players`
+2. Trigger `scrape-backfill` manually — full historical matches sweep (~2.5 h, holds the artifact lock; other jobs queue behind it automatically)
+3. Enable scheduled runs — `scrape-fast` and `scrape-slow` maintain the DB from here on

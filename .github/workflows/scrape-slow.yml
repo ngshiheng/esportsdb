@@ -52,7 +52,7 @@ jobs:
               run: |
                   uv run main.py \
                     --db data/esports.db \
-                    --resources series,tournaments,teams,players
+                    --resources videogames,leagues,series,tournaments,teams,players
 
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
             - name: Validate DB
