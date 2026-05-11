@@ -62,20 +62,33 @@ ALL_RESOURCES = (
     "videogames",
     "leagues",
     "series",
+    "series_upcoming",
+    "series_running",
     "tournaments",
+    "tournaments_upcoming",
+    "tournaments_running",
     "matches",
+    "matches_upcoming",
+    "matches_running",
     "teams",
     "players",
 )
 
 # FK dependency graph: if you request a child resource without its parents in
 # the same run, the parent tables must already be populated in the database.
-# scrape-slow handles parents; scrape-fast handles matches only.
+# scrape-slow handles full historical rescrape; scrape-fast handles upcoming/running
+# sub-endpoints and incremental matches.
 RESOURCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "leagues": ("videogames",),
     "series": ("videogames", "leagues"),
+    "series_upcoming": ("videogames", "leagues"),
+    "series_running": ("videogames", "leagues"),
     "tournaments": ("videogames", "leagues", "series"),
+    "tournaments_upcoming": ("videogames", "leagues", "series"),
+    "tournaments_running": ("videogames", "leagues", "series"),
     "matches": ("videogames", "leagues", "series", "tournaments"),
+    "matches_upcoming": ("videogames", "leagues", "series", "tournaments"),
+    "matches_running": ("videogames", "leagues", "series", "tournaments"),
     "players": ("videogames", "teams"),
 }
 
@@ -522,6 +535,7 @@ def scrape_resource(
     to_row: Any,
     table: str,
     extra_rows_fn: Any = None,
+    skip_fk_errors: bool = False,
 ) -> int:
     """Page through one endpoint, upsert rows, and commit after each page.
 
@@ -548,6 +562,8 @@ def scrape_resource(
                     exc,
                     row,
                 )
+                if skip_fk_errors:
+                    continue
                 raise
             if extra_rows_fn:
                 for extra_row in extra_rows_fn(record):
@@ -561,6 +577,8 @@ def scrape_resource(
                             exc,
                             extra_row,
                         )
+                        if skip_fk_errors:
+                            continue
                         raise
         db.commit()
         total += len(page)
@@ -571,11 +589,50 @@ RESOURCE_CONFIG: dict[str, dict[str, Any]] = {
     "videogames": {"table": "videogames", "to_row": videogame_to_row},
     "leagues": {"table": "leagues", "to_row": league_to_row},
     "series": {"table": "series", "to_row": series_to_row},
+    "series_upcoming": {
+        "endpoint": "series/upcoming",
+        "table": "series",
+        "to_row": series_to_row,
+        "skip_fk_errors": True,
+    },
+    "series_running": {
+        "endpoint": "series/running",
+        "table": "series",
+        "to_row": series_to_row,
+        "skip_fk_errors": True,
+    },
     "tournaments": {"table": "tournaments", "to_row": tournament_to_row},
+    "tournaments_upcoming": {
+        "endpoint": "tournaments/upcoming",
+        "table": "tournaments",
+        "to_row": tournament_to_row,
+        "skip_fk_errors": True,
+    },
+    "tournaments_running": {
+        "endpoint": "tournaments/running",
+        "table": "tournaments",
+        "to_row": tournament_to_row,
+        "skip_fk_errors": True,
+    },
     "matches": {
         "table": "matches",
         "to_row": match_to_row,
         "extra_rows_fn": match_opponent_rows,
+        "skip_fk_errors": True,
+    },
+    "matches_upcoming": {
+        "endpoint": "matches/upcoming",
+        "table": "matches",
+        "to_row": match_to_row,
+        "extra_rows_fn": match_opponent_rows,
+        "skip_fk_errors": True,
+    },
+    "matches_running": {
+        "endpoint": "matches/running",
+        "table": "matches",
+        "to_row": match_to_row,
+        "extra_rows_fn": match_opponent_rows,
+        "skip_fk_errors": True,
     },
     "teams": {"table": "teams", "to_row": team_to_row},
     "players": {"table": "players", "to_row": player_to_row},
@@ -605,8 +662,10 @@ def run_scrape(config: ScraperConfig) -> None:
             if cfg is None:
                 log.warning("Unknown resource '%s' — skipping.", resource)
                 continue
-            log.info("  Scraping /%s ...", resource)
-            count = scrape_resource(client, db, endpoint=resource, **cfg)
+            cfg = dict(cfg)  # copy — avoid mutating the module-level dict
+            endpoint = cfg.pop("endpoint", resource)
+            log.info("  Scraping /%s ...", endpoint)
+            count = scrape_resource(client, db, endpoint=endpoint, **cfg)
             log.info("    → %d records upserted.", count)
     finally:
         client.close()

@@ -1,4 +1,4 @@
-name: Scrape (incremental matches)
+name: Scrape (incremental — upcoming & recent)
 
 on:
     schedule:
@@ -50,7 +50,15 @@ jobs:
                     fi
                   done
 
-            - name: Scrape incremental matches
+            - name: Scrape upcoming & live data
+              env:
+                  PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
+              run: |
+                  uv run main.py \
+                    --db data/esports.db \
+                    --resources series_upcoming,series_running,tournaments_upcoming,tournaments_running,matches_upcoming,matches_running
+
+            - name: Scrape recent past matches
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
