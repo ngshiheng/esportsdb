@@ -216,6 +216,22 @@ class PandaScoreClient:
             raise
         return response.json()
 
+    def fetch_total(self, endpoint: str) -> int | None:
+        """Return the total record count for an endpoint via X-Total header.
+
+        Costs exactly one API request (page[size]=1).
+        Returns None if the header is absent.
+        """
+        url = f"{PANDASCORE_BASE_URL}/{endpoint}"
+        response = self._http.get(
+            url,
+            params={"page[number]": 1, "page[size]": 1, "sort": "id"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        raw = response.headers.get("X-Total")
+        return int(raw) if raw is not None else None
+
     def fetch_all(self, endpoint: str) -> Generator[list[dict[str, Any]], None, None]:
         """Yield one page at a time; caller commits after each batch."""
         page_number = 1
@@ -775,8 +791,47 @@ def main() -> None:
         metavar="SECS",
         help="Seconds between paginated requests. Default keeps throughput ~900 req/hr.",
     )
+    parser.add_argument(
+        "--count",
+        action="store_true",
+        help=(
+            "Print the total record count for each requested resource "
+            "(1 API request per resource) then exit. Does not scrape."
+        ),
+    )
 
-    run_scrape(_build_config(parser.parse_args()))
+    args = parser.parse_args()
+
+    if args.count:
+        api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit(
+                "Error: PANDASCORE_API_KEY environment variable is not set."
+            )
+        client = PandaScoreClient(api_key=api_key)
+        requested = [r.strip() for r in args.resources.split(",") if r.strip()]
+        try:
+            for resource in requested:
+                cfg = RESOURCE_CONFIG.get(resource)
+                if cfg is None:
+                    print(f"{resource}: unknown resource")
+                    continue
+                endpoint = cfg.get("endpoint", resource)
+                total = client.fetch_total(endpoint)
+                pages = ((total - 1) // DEFAULT_PAGE_SIZE + 1) if total else "?"
+                delay_min = (
+                    (pages if isinstance(pages, int) else 0) * INTER_PAGE_DELAY_SECONDS
+                ) / 60
+                print(
+                    f"{endpoint}: {total:,} records  "
+                    f"~{pages} pages  "
+                    f"~{delay_min:.1f} min delay"
+                )
+        finally:
+            client.close()
+        return
+
+    run_scrape(_build_config(args))
 
 
 if __name__ == "__main__":
