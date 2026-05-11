@@ -18,8 +18,11 @@ concurrency:
     cancel-in-progress: false
 
 jobs:
-    scrape-build:
+    scrape:
         runs-on: ubuntu-latest
+        permissions:
+            actions: read
+            contents: read
 
         steps:
             - uses: actions/checkout@v4
@@ -31,9 +34,9 @@ jobs:
             - name: Get latest artifact run id
               run: |
                   ARTIFACT_RUN_ID=$(curl -s \
-                    -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+                    -H "Authorization: Bearer ${{ github.token }}" \
                     "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=esportsdb&per_page=1" \
-                    | jq '.artifacts[0].workflow_run.id')
+                    | jq '.artifacts[0].workflow_run.id // empty')
                   echo "artifact_run_id=$ARTIFACT_RUN_ID" >> $GITHUB_ENV
 
             - name: Download previous DB artifact
@@ -42,7 +45,7 @@ jobs:
                   name: esportsdb
                   path: ./data/
                   run-id: ${{ env.artifact_run_id }}
-                  github-token: ${{ secrets.GH_PAT }}
+                  github-token: ${{ github.token }}
               # First-ever run has no artifact — let the scraper bootstrap a fresh DB.
               continue-on-error: true
 

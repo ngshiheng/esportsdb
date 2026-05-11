@@ -617,7 +617,11 @@ RESOURCE_CONFIG: dict[str, dict[str, Any]] = {
         "to_row": series_to_row,
         "skip_fk_errors": True,
     },
-    "tournaments": {"table": "tournaments", "to_row": tournament_to_row},
+    "tournaments": {
+        "table": "tournaments",
+        "to_row": tournament_to_row,
+        "skip_fk_errors": True,
+    },
     "tournaments_upcoming": {
         "endpoint": "tournaments/upcoming",
         "table": "tournaments",
