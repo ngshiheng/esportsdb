@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "backoff>=2.2",
 #   "hishel>=1.2",
 #   "httpx>=0.27",
+#   "tenacity>=9.0",
 #   "typer>=0.12",
 # ]
 # ///
@@ -44,20 +44,26 @@ import logging
 import os
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Generator
 
-import backoff
 import httpx
 import typer
 from hishel import SyncSqliteStorage
 from hishel.httpx import SyncCacheClient
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 PANDASCORE_BASE_URL = "https://api.pandascore.co"
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_DB_PATH = Path("data/esports.db")
-HTTP_TOO_MANY_REQUESTS = 429
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2.0
 INTER_PAGE_DELAY_SECONDS = (
@@ -109,15 +115,20 @@ app = typer.Typer()
 
 
 class RateLimitError(Exception):
-    """Raised when PandaScore returns HTTP 429 so backoff can retry it."""
+    """Raised when PandaScore returns HTTP 429 so tenacity can retry it."""
 
 
-def _on_backoff(details: dict) -> None:
-    exc = details["exception"]
-    endpoint = details["args"][1]
-    page_number = details["args"][2]
-    wait = details["wait"]
-    tries = details["tries"]
+class ServerError(Exception):
+    """Raised when PandaScore returns a 5xx so tenacity can retry it."""
+
+
+def _before_sleep(retry_state: RetryCallState) -> None:
+    exc = retry_state.outcome.exception()
+    args = retry_state.args
+    endpoint = args[1] if len(args) > 1 else "?"
+    page_number = args[2] if len(args) > 2 else "?"
+    wait = retry_state.upcoming_sleep
+    tries = retry_state.attempt_number
     if isinstance(exc, RateLimitError):
         log.warning(
             "Rate limited on /%s page %d (attempt %d) — backing off %.1fs.",
@@ -195,14 +206,14 @@ class PandaScoreClient:
         }
         return params
 
-    @backoff.on_exception(
-        backoff.expo,
-        (httpx.RequestError, RateLimitError),
-        max_tries=MAX_RETRIES,
-        factor=INITIAL_BACKOFF_SECONDS,
-        jitter=None,
-        on_backoff=_on_backoff,
-        logger=None,
+    @retry(
+        retry=retry_if_exception_type(
+            (httpx.RequestError, RateLimitError, ServerError)
+        ),
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_exponential(multiplier=1, min=INITIAL_BACKOFF_SECONDS, max=60),
+        before_sleep=_before_sleep,
+        reraise=True,
     )
     def _fetch_page_with_retry(
         self, endpoint: str, page_number: int
@@ -213,13 +224,26 @@ class PandaScoreClient:
             params=self._page_params(page_number, endpoint),
             timeout=30.0,
         )
-        if response.status_code == HTTP_TOO_MANY_REQUESTS:
+        if response.status_code == 429:
             raise RateLimitError(f"429 on /{endpoint} page {page_number}")
+
+        if response.status_code >= 500:
+            log.error(
+                "HTTP %d on /%s page %d", response.status_code, endpoint, page_number
+            )
+            raise ServerError(
+                f"{response.status_code} on /{endpoint} page {page_number}"
+            )
+
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             log.error("HTTP %d on /%s: %s", exc.response.status_code, endpoint, exc)
             raise
+
+        if response.extensions.get("hishel_from_cache"):
+            log.info("/%s page %d served from cache", endpoint, page_number)
+
         return response.json()
 
     def fetch_total(self, endpoint: str) -> int | None:
@@ -617,11 +641,12 @@ def scrape_resource(
                             raise
             db.commit()
             total += len(page)
-    except RateLimitError:
+    except (RateLimitError, ServerError) as exc:
         log.warning(
-            "Rate limit exhausted on /%s after %d records — saving partial progress.",
+            "Request failed on /%s after %d records — saving partial progress: %s",
             endpoint,
             total,
+            exc,
         )
     return total
 
@@ -685,23 +710,26 @@ RESOURCE_CONFIG: dict[str, dict[str, Any]] = {
 
 
 def run_scrape(config: ScraperConfig) -> None:
-    client = PandaScoreClient(
-        api_key=config.api_key,
-        page_size=config.page_size,
-        since=config.since,
-        page_delay=config.page_delay,
-    )
-    db = Database(path=config.db_path)
-    db.ensure_schema()
+    with (
+        closing(
+            PandaScoreClient(
+                api_key=config.api_key,
+                page_size=config.page_size,
+                since=config.since,
+                page_delay=config.page_delay,
+            )
+        ) as client,
+        closing(Database(path=config.db_path)) as db,
+    ):
+        db.ensure_schema()
 
-    log.info(
-        "Starting scrape: %s%s",
-        list(config.resources),
-        f" (since {config.since})" if config.since else "",
-    )
-    started_at = time.monotonic()
+        log.info(
+            "Starting scrape: %s%s",
+            list(config.resources),
+            f" (since {config.since})" if config.since else "",
+        )
+        started_at = time.monotonic()
 
-    try:
         for resource in config.resources:
             cfg = RESOURCE_CONFIG.get(resource)
             if cfg is None:
@@ -712,9 +740,6 @@ def run_scrape(config: ScraperConfig) -> None:
             log.info("  Scraping /%s ...", endpoint)
             count = scrape_resource(client, db, endpoint=endpoint, **cfg)
             log.info("    → %d records upserted.", count)
-    finally:
-        client.close()
-        db.close()
 
     log.info("Scrape complete in %.1fs.", time.monotonic() - started_at)
 
@@ -833,8 +858,7 @@ def main(
             raise SystemExit(
                 "Error: PANDASCORE_API_KEY environment variable is not set."
             )
-        client = PandaScoreClient(api_key=api_key)
-        try:
+        with closing(PandaScoreClient(api_key=api_key)) as client:
             for res in resources:
                 cfg = RESOURCE_CONFIG.get(res)
                 if cfg is None:
@@ -851,8 +875,6 @@ def main(
                     f"~{pages} pages  "
                     f"~{delay_min:.1f} min delay"
                 )
-        finally:
-            client.close()
         return
 
     run_scrape(_build_config(db, resources, page_size, since, page_delay))

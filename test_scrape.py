@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "backoff>=2.2",
 #   "hishel>=1.2",
 #   "httpx>=0.27",
+#   "tenacity>=9.0",
 #   "typer>=0.12",
 #   "pytest>=8.0",
 # ]
