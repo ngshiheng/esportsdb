@@ -34,7 +34,7 @@ Cron examples:
     # Fast table — incremental every 2 hours (~5 req/run)
     0 */2 * * * PANDASCORE_API_KEY=sk-xxx ./scrape.py --resource matches --since 48h
 
-Rate budget: default --page-delay of 4.0s keeps throughput at ~900 req/hr (limit: 1,000/hr).
+Rate budget: default --page-delay of 5.0s keeps throughput at ~720 req/hr (limit: 1,000/hr).
 HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run immediately.
 """
 
@@ -51,7 +51,7 @@ from typing import Annotated, Any, Generator
 
 import httpx
 import typer
-from hishel import SyncSqliteStorage
+from hishel import FilterPolicy, SyncSqliteStorage
 from hishel.httpx import SyncCacheClient
 from tenacity import (
     RetryCallState,
@@ -189,9 +189,15 @@ class PandaScoreClient:
     _http: SyncCacheClient = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        storage = SyncSqliteStorage(default_ttl=7200)
+        # default_ttl=None: entries never expire by TTL.
+        # FilterPolicy: bypasses HTTP spec checks (PandaScore sends
+        # Cache-Control: no-store) so responses are cached and served
+        # regardless of server expiration directives.
+        storage = SyncSqliteStorage(default_ttl=None)
+        policy = FilterPolicy()
         self._http = SyncCacheClient(
             storage=storage,
+            policy=policy,
             headers={"Authorization": f"Bearer {self.api_key}"},
         )
 

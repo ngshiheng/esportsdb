@@ -149,12 +149,12 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 
 ## Rate Limiting & Caching
 
-| Setting          | Value                      | Notes                                                           |
-| ---------------- | -------------------------- | --------------------------------------------------------------- |
-| Inter-page delay | 4.0 s (3.0 s for backfill) | Keeps throughput ~900 req/hr vs 1,000/hr limit                  |
-| HTTP cache TTL   | 2 hours                    | `hishel` SQLite-backed cache — crash-safe to re-run immediately |
-| Max retries      | 5                          | Exponential backoff on `httpx.RequestError` and HTTP 429        |
-| Backoff factor   | 2.0 s initial              | `backoff.expo` with no jitter                                   |
+| Setting          | Value                      | Notes                                                                                                                   |
+| ---------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Inter-page delay | 5.0 s (3.0 s for backfill) | Keeps throughput ~720 req/hr vs 1,000/hr limit                                                                          |
+| HTTP cache TTL   | None (no expiry)           | `hishel` SQLite-backed cache — entries persist until manually cleared; `FilterPolicy` ignores server expiration headers |
+| Max retries      | 5                          | Exponential backoff on `httpx.RequestError` and HTTP 429                                                                |
+| Backoff factor   | 2.0 s initial              | `tenacity` `wait_exponential`, min 2 s, max 60 s                                                                        |
 
 ## Secrets required
 
