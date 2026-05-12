@@ -1,7 +1,7 @@
 # esportsdb
 
-[![Scrape (daily)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml)
 [![Scrape (upcoming)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml)
+[![Scrape (daily)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml)
 [![Scrape (historical backfill)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml)
 
 A self-contained PandaScore scraper that builds and maintains a SQLite database of esports data (videogames, leagues, series, tournaments, matches, teams, players). The DB is persisted as a GitHub Actions artifact and kept fresh via a three-workflow CI pipeline.
@@ -156,55 +156,9 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 | Max retries      | 5                          | Exponential backoff on `httpx.RequestError` and HTTP 429        |
 | Backoff factor   | 2.0 s initial              | `backoff.expo` with no jitter                                   |
 
-## Backfill estimates (as of May 2026)
-
-| Metric                           | Value      |
-| -------------------------------- | ---------- |
-| Total matches                    | ~253,333   |
-| Pages at 100/page                | ~2,534     |
-| Runtime (3 s delay + network)    | ~2.5 hours |
-| Estimated DB size after backfill | ~178 MB    |
-| GitHub artifact limit            | 2 GB       |
-
 ## Secrets required
 
 | Secret               | Used by                                                       |
 | -------------------- | ------------------------------------------------------------- |
 | `PANDASCORE_API_KEY` | All scrape jobs                                               |
 | `GH_PAT`             | Artifact download across workflow runs (needs `actions:read`) |
-
-## Local usage
-
-```bash
-# Install uv (if needed)
-brew install uv
-
-# Run full scrape
-PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run
-
-# Specific resources only
-PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource leagues --resource teams --resource players
-
-# Incremental matches (last 48 h)
-PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource matches --since 48h
-
-# Check total record counts without scraping (1 request per resource)
-PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource matches --resource series --resource tournaments --count
-```
-
-### CLI flags
-
-| Flag           | Default           | Description                                                                            |
-| -------------- | ----------------- | -------------------------------------------------------------------------------------- |
-| `--db`         | `data/esports.db` | SQLite database path                                                                   |
-| `--resource`   | all resources     | Resource to scrape. Repeatable (`--resource a --resource b`)                           |
-| `--since`      | `None`            | Lower-bound filter for matches (`48h`, `7d`, or ISO-8601). Ignored for other resources |
-| `--page-size`  | `100`             | Records per API page                                                                   |
-| `--page-delay` | `5.0`             | Seconds between paginated requests                                                     |
-| `--count`      | `False`           | Print total record counts and exit (no scrape)                                         |
-
-## Go-live order
-
-1. Run `scrape-daily` once — populates `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players`
-2. Trigger `backfill` manually — full historical matches sweep (~2.5 h, holds the artifact lock; other jobs queue behind it automatically)
-3. Enable scheduled runs — `scrape-upcoming` and `scrape-daily` maintain the DB from here on
