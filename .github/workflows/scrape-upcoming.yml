@@ -62,17 +62,22 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
-                  uv run main.py \
+                  uv run scrape.py \
                     --db data/esports.db \
-                    --resources series_upcoming,series_running,tournaments_upcoming,tournaments_running,matches_upcoming,matches_running
+                    --resource series_upcoming \
+                    --resource series_running \
+                    --resource tournaments_upcoming \
+                    --resource tournaments_running \
+                    --resource matches_upcoming \
+                    --resource matches_running
 
             - name: Scrape recent past matches
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
-                  uv run main.py \
+                  uv run scrape.py \
                     --db data/esports.db \
-                    --resources matches \
+                    --resource matches \
                     --since 48h
 
             # Matches table must be non-empty — a fully empty DB indicates

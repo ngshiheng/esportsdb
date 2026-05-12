@@ -3,13 +3,6 @@ name: Scrape (daily tables)
 on:
     schedule:
         - cron: "0 2 * * *" # Daily at 02:00 UTC
-    push:
-        branches: [main]
-        paths:
-            - "**.py"
-            - ".github/workflows/**"
-            - Makefile
-            - data/metadata.json
     workflow_dispatch:
 
 concurrency:
@@ -58,9 +51,14 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
-                  uv run main.py \
+                  uv run scrape.py \
                     --db data/esports.db \
-                    --resources videogames,leagues,series,tournaments,teams,players
+                    --resource videogames \
+                    --resource leagues \
+                    --resource series \
+                    --resource tournaments \
+                    --resource teams \
+                    --resource players
 
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
             # Runs even when scrape was rate-limited so partial progress is preserved.

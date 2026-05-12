@@ -48,9 +48,9 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
-                  uv run main.py \
+                  uv run scrape.py \
                     --db data/esports.db \
-                    --resources matches \
+                    --resource matches \
                     --page-delay 3
 
             - name: Validate DB

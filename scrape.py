@@ -5,6 +5,7 @@
 #   "backoff>=2.2",
 #   "hishel>=1.2",
 #   "httpx>=0.27",
+#   "typer>=0.12",
 # ]
 # ///
 """
@@ -13,22 +14,25 @@ PandaScore periodic scraper — populates a local SQLite database.
 Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
-    ./main.py
-    ./main.py --db /data/esports.db
-    ./main.py --resources leagues,teams,players
+    ./scrape.py
+    ./scrape.py --db /data/esports.db
+    ./scrape.py --resource leagues --resource teams --resource players
 
     # Incremental matches only (last 48 hours):
-    ./main.py --resources matches --since 48h
+    ./scrape.py --resource matches --since 48h
 
     # Historical backfill (one-time, safe to Ctrl-C and re-run):
-    ./main.py --resources matches
+    ./scrape.py --resource matches
+
+    # Print record counts without scraping:
+    ./scrape.py --count
 
 Cron examples:
     # Slow tables — full rescrape once daily (~304 req, ~20 min)
-    0 2 * * *   PANDASCORE_API_KEY=sk-xxx ./main.py --resources videogames,leagues,series,tournaments,teams,players
+    0 2 * * *   PANDASCORE_API_KEY=sk-xxx ./scrape.py --resource videogames --resource leagues --resource series --resource tournaments --resource teams --resource players
 
     # Fast table — incremental every 2 hours (~5 req/run)
-    0 */2 * * * PANDASCORE_API_KEY=sk-xxx ./main.py --resources matches --since 48h
+    0 */2 * * * PANDASCORE_API_KEY=sk-xxx ./scrape.py --resource matches --since 48h
 
 Rate budget: default --page-delay of 4.0s keeps throughput at ~900 req/hr (limit: 1,000/hr).
 HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run immediately.
@@ -36,17 +40,17 @@ HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run i
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generator
+from typing import Annotated, Any, Generator
 
 import backoff
 import httpx
+import typer
 from hishel import SyncSqliteStorage
 from hishel.httpx import SyncCacheClient
 
@@ -100,6 +104,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+app = typer.Typer()
 
 
 class RateLimitError(Exception):
@@ -728,17 +734,22 @@ def _parse_since(value: str) -> str:
     return value
 
 
-def _build_config(args: argparse.Namespace) -> ScraperConfig:
+def _build_config(
+    db: Path,
+    resources: list[str],
+    page_size: int,
+    since: str | None,
+    page_delay: float,
+) -> ScraperConfig:
     api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("Error: PANDASCORE_API_KEY environment variable is not set.")
 
-    requested = [r.strip() for r in args.resources.split(",") if r.strip()]
-    unknown = set(requested) - set(ALL_RESOURCES)
+    unknown = set(resources) - set(ALL_RESOURCES)
     if unknown:
         log.warning("Unrecognised resources will be skipped: %s", unknown)
 
-    valid = [r for r in requested if r in ALL_RESOURCES]
+    valid = [r for r in resources if r in ALL_RESOURCES]
     if not valid:
         raise SystemExit("Error: no valid resources specified.")
 
@@ -758,88 +769,78 @@ def _build_config(args: argparse.Namespace) -> ScraperConfig:
                 missing_parents,
             )
 
-    since: str | None = None
-    if args.since:
-        since = _parse_since(args.since)
-        log.info("Incremental mode: filtering matches to begin_at >= %s", since)
+    resolved_since: str | None = None
+    if since:
+        resolved_since = _parse_since(since)
+        log.info(
+            "Incremental mode: filtering matches to begin_at >= %s", resolved_since
+        )
 
     return ScraperConfig(
         api_key=api_key,
-        db_path=Path(args.db),
+        db_path=db,
         resources=tuple(valid),
-        page_size=args.page_size,
-        since=since,
-        page_delay=args.page_delay,
+        page_size=page_size,
+        since=resolved_since,
+        page_delay=page_delay,
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Scrape PandaScore API into SQLite. Reads PANDASCORE_API_KEY from env.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--db",
-        default=str(DEFAULT_DB_PATH),
-        metavar="PATH",
-        help="SQLite database file path.",
-    )
-    parser.add_argument(
-        "--resources",
-        default=",".join(ALL_RESOURCES),
-        metavar="LIST",
-        help=f"Comma-separated resources. Options: {', '.join(ALL_RESOURCES)}",
-    )
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        default=DEFAULT_PAGE_SIZE,
-        metavar="N",
-        help="Records per API page.",
-    )
-    parser.add_argument(
-        "--since",
-        default=None,
-        metavar="WHEN",
-        help=(
-            "Only fetch matches with begin_at >= WHEN. "
-            "Accepts ISO-8601 (2025-01-01T00:00:00Z) or shorthand: 48h, 7d. "
-            "Ignored for non-match resources."
+@app.command()
+def main(
+    db: Annotated[
+        Path, typer.Option(help="SQLite database file path.")
+    ] = DEFAULT_DB_PATH,
+    resource: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--resource",
+            help=f"Resource to scrape. Repeatable. Options: {', '.join(ALL_RESOURCES)}",
         ),
-    )
-    parser.add_argument(
-        "--page-delay",
-        type=float,
-        default=INTER_PAGE_DELAY_SECONDS,
-        metavar="SECS",
-        help="Seconds between paginated requests. Default keeps throughput ~900 req/hr.",
-    )
-    parser.add_argument(
-        "--count",
-        action="store_true",
-        help=(
-            "Print the total record count for each requested resource "
-            "(1 API request per resource) then exit. Does not scrape."
+    ] = None,
+    page_size: Annotated[
+        int, typer.Option(help="Records per API page.")
+    ] = DEFAULT_PAGE_SIZE,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Only fetch matches with begin_at >= WHEN. "
+                "Accepts ISO-8601 (2025-01-01T00:00:00Z) or shorthand: 48h, 7d. "
+                "Ignored for non-match resources."
+            )
         ),
-    )
+    ] = None,
+    page_delay: Annotated[
+        float,
+        typer.Option(
+            help="Seconds between paginated requests. Default keeps throughput ~900 req/hr."
+        ),
+    ] = INTER_PAGE_DELAY_SECONDS,
+    count: Annotated[
+        bool,
+        typer.Option(
+            "--count/--no-count",
+            help="Print the total record count for each requested resource (1 API request per resource) then exit. Does not scrape.",
+        ),
+    ] = False,
+) -> None:
+    resources = resource or list(ALL_RESOURCES)
 
-    args = parser.parse_args()
-
-    if args.count:
+    if count:
         api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
         if not api_key:
             raise SystemExit(
                 "Error: PANDASCORE_API_KEY environment variable is not set."
             )
         client = PandaScoreClient(api_key=api_key)
-        requested = [r.strip() for r in args.resources.split(",") if r.strip()]
         try:
-            for resource in requested:
-                cfg = RESOURCE_CONFIG.get(resource)
+            for res in resources:
+                cfg = RESOURCE_CONFIG.get(res)
                 if cfg is None:
-                    print(f"{resource}: unknown resource")
+                    print(f"{res}: unknown resource")
                     continue
-                endpoint = cfg.get("endpoint", resource)
+                endpoint = cfg.get("endpoint", res)
                 total = client.fetch_total(endpoint)
                 pages = ((total - 1) // DEFAULT_PAGE_SIZE + 1) if total else "?"
                 delay_min = (
@@ -854,8 +855,8 @@ def main() -> None:
             client.close()
         return
 
-    run_scrape(_build_config(args))
+    run_scrape(_build_config(db, resources, page_size, since, page_delay))
 
 
 if __name__ == "__main__":
-    main()
+    app()

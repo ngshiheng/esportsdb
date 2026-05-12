@@ -1,26 +1,28 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "backoff>=2.2",
+#   "hishel>=1.2",
+#   "httpx>=0.27",
+#   "typer>=0.12",
+#   "pytest>=8.0",
+# ]
+# ///
 from unittest.mock import MagicMock, patch
 
-import main
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+import scrape as main
 
 
 def make_client(since=None, page_size=3, page_delay=0.0):
     """Return a PandaScoreClient with all HTTP internals mocked out."""
-    with patch("main.SyncSqliteStorage"), patch("main.SyncCacheClient"):
+    with patch("scrape.SyncSqliteStorage"), patch("scrape.SyncCacheClient"):
         return main.PandaScoreClient(
             api_key="test-key",
             page_size=page_size,
             since=since,
             page_delay=page_delay,
         )
-
-
-# ---------------------------------------------------------------------------
-# fetch_all — incremental (since) filtering  [HIGHEST RISK]
-# ---------------------------------------------------------------------------
 
 
 def test_fetch_all_since_stops_early_when_page_crosses_cutoff():
@@ -115,11 +117,6 @@ def test_fetch_all_no_since_yields_all_pages_and_stops_on_partial():
     assert mock_fetch.call_count == 2
 
 
-# ---------------------------------------------------------------------------
-# match_opponent_rows  [HIGH RISK — nested extraction + is_winner logic]
-# ---------------------------------------------------------------------------
-
-
 def test_match_opponent_rows_basic():
     """
     Two opponents with a declared winner: the winning opponent gets is_winner=1,
@@ -192,11 +189,6 @@ def test_match_opponent_rows_no_winner_sets_is_winner_none():
     rows = main.match_opponent_rows(record)
 
     assert all(row["is_winner"] is None for row in rows)
-
-
-# ---------------------------------------------------------------------------
-# _parse_since
-# ---------------------------------------------------------------------------
 
 
 def test_parse_since_hours():
@@ -294,11 +286,6 @@ def test_scrape_resource_raises_on_fk_error_when_skip_is_false():
             )
 
 
-# ---------------------------------------------------------------------------
-# _nested_id
-# ---------------------------------------------------------------------------
-
-
 def test_nested_id_extracts_id_from_dict():
     assert main._nested_id({"videogame": {"id": 7, "name": "CS2"}}, "videogame") == 7
 
@@ -311,3 +298,11 @@ def test_nested_id_returns_none_when_value_is_not_dict():
     # API occasionally returns a scalar or null for nested objects
     assert main._nested_id({"videogame": None}, "videogame") is None
     assert main._nested_id({"videogame": 42}, "videogame") is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
