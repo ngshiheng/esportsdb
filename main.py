@@ -185,10 +185,8 @@ class PandaScoreClient:
         params: dict[str, Any] = {
             "page[number]": page_number,
             "page[size]": self.page_size,
-            "sort": "id",
+            "sort": "-begin_at" if (self.since and endpoint == "matches") else "id",
         }
-        if self.since and endpoint == "matches":
-            params["filter[begin_at][gte]"] = self.since
         return params
 
     @backoff.on_exception(
@@ -241,7 +239,19 @@ class PandaScoreClient:
             records = self._fetch_page_with_retry(endpoint, page_number)
             if not records:
                 break
-            yield records
+            if self.since and endpoint == "matches":
+                # Sort is -begin_at (newest first); stop once records go before cutoff
+                filtered = [
+                    r
+                    for r in records
+                    if r.get("begin_at") and r["begin_at"] >= self.since
+                ]
+                if filtered:
+                    yield filtered
+                if len(filtered) < len(records):
+                    break
+            else:
+                yield records
             if len(records) < self.page_size:
                 break
             page_number += 1
