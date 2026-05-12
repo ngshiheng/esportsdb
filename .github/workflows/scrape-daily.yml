@@ -12,7 +12,6 @@ on:
             - data/metadata.json
     workflow_dispatch:
 
-# Only one run may hold the shared DB artifact at a time.
 concurrency:
     group: esports-db-artifact
     cancel-in-progress: false
