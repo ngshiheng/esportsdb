@@ -9,9 +9,9 @@ flowchart TD
     PS[("PandaScore API<br>api.pandascore.co")]
 
     subgraph CI ["GitHub Actions (serialised via concurrency group)"]
-        S["scrape-slow.yml<br>Daily 02:00 UTC<br>all non-match tables"]
-        F["scrape-fast.yml<br>Every 2 hours<br>upcoming / live / recent matches"]
-        B["scrape-backfill.yml<br>workflow_dispatch only<br>full historical matches sweep"]
+        S["scrape-daily.yml<br>Daily 02:00 UTC<br>all non-match tables"]
+        F["scrape-upcoming.yml<br>Every 2 hours<br>upcoming / live / recent matches"]
+        B["backfill.yml<br>workflow_dispatch only<br>full historical matches sweep"]
     end
 
     ART[("GitHub Artifact<br>esports.db")]
@@ -35,11 +35,12 @@ All three workflows share the **`esportsdb-artifact` concurrency group** (`cance
 
 | Workflow              | Schedule                 | Resources                                                            | Purpose                                                              |
 | --------------------- | ------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `scrape-slow.yml`     | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match tables                          |
-| `scrape-fast.yml`     | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h`                     | Keep upcoming/live data fresh; catch recently finalised match scores |
-| `scrape-backfill.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
+| `scrape-daily.yml`    | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match tables                          |
+| `scrape-upcoming.yml` | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h`                     | Keep upcoming/live data fresh; catch recently finalised match scores |
+| `backfill.yml`        | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
+| `test.yml`            | Every push / PR          | —                                                                    | Run unit tests                                                       |
 
-### scrape-fast detail
+### scrape-upcoming detail
 
 Two sequential scrape steps per run:
 
@@ -175,16 +176,16 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 brew install uv
 
 # Run full scrape
-PANDASCORE_API_KEY=sk-xxx uv run main.py
+PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run
 
 # Specific resources only
-PANDASCORE_API_KEY=sk-xxx uv run main.py --resources leagues,teams,players
+PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource leagues --resource teams --resource players
 
 # Incremental matches (last 48 h)
-PANDASCORE_API_KEY=sk-xxx uv run main.py --resources matches --since 48h
+PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource matches --since 48h
 
 # Check total record counts without scraping (1 request per resource)
-PANDASCORE_API_KEY=sk-xxx uv run main.py --resources matches,series,tournaments --count
+PANDASCORE_API_KEY=sk-xxx uv run scrape.py scrape run --resource matches --resource series --resource tournaments --count
 ```
 
 ### CLI flags
@@ -192,14 +193,14 @@ PANDASCORE_API_KEY=sk-xxx uv run main.py --resources matches,series,tournaments 
 | Flag           | Default           | Description                                                                            |
 | -------------- | ----------------- | -------------------------------------------------------------------------------------- |
 | `--db`         | `data/esports.db` | SQLite database path                                                                   |
-| `--resources`  | all resources     | Comma-separated list of resources to scrape                                            |
+| `--resource`   | all resources     | Resource to scrape. Repeatable (`--resource a --resource b`)                           |
 | `--since`      | `None`            | Lower-bound filter for matches (`48h`, `7d`, or ISO-8601). Ignored for other resources |
 | `--page-size`  | `100`             | Records per API page                                                                   |
-| `--page-delay` | `4.0`             | Seconds between paginated requests                                                     |
+| `--page-delay` | `5.0`             | Seconds between paginated requests                                                     |
 | `--count`      | `False`           | Print total record counts and exit (no scrape)                                         |
 
 ## Go-live order
 
-1. Run `scrape-slow` once — populates `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players`
-2. Trigger `scrape-backfill` manually — full historical matches sweep (~2.5 h, holds the artifact lock; other jobs queue behind it automatically)
-3. Enable scheduled runs — `scrape-fast` and `scrape-slow` maintain the DB from here on
+1. Run `scrape-daily` once — populates `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players`
+2. Trigger `backfill` manually — full historical matches sweep (~2.5 h, holds the artifact lock; other jobs queue behind it automatically)
+3. Enable scheduled runs — `scrape-upcoming` and `scrape-daily` maintain the DB from here on

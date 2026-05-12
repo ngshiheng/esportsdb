@@ -16,4 +16,4 @@ jobs:
                   uv-version: "0.10.7"
 
             - name: Run tests
-              run: uv run --script test_scrape.py -v
+              run: make test
