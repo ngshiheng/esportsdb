@@ -1,5 +1,9 @@
 # esportsdb
 
+[![Scrape (daily)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml)
+[![Scrape (upcoming)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml)
+[![Scrape (historical backfill)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml)
+
 A self-contained PandaScore scraper that builds and maintains a SQLite database of esports data (videogames, leagues, series, tournaments, matches, teams, players). The DB is persisted as a GitHub Actions artifact and kept fresh via a three-workflow CI pipeline.
 
 ## How it works

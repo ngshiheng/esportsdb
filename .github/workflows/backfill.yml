@@ -1,10 +1,9 @@
-name: Scrape (historical backfill — manual only)
+name: Scrape (historical backfill)
 
 # Triggered manually ONLY. Never scheduled — this run takes ~2.5 hours.
 on:
     workflow_dispatch:
 
-# Holds the shared DB artifact lock for the full duration.
 concurrency:
     group: esports-db-artifact
     cancel-in-progress: false

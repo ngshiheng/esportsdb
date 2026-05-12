@@ -1,4 +1,4 @@
-name: Scrape (daily tables)
+name: Scrape (daily)
 
 on:
     schedule:

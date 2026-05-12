@@ -1,4 +1,4 @@
-name: Scrape (incremental — upcoming & recent)
+name: Scrape (upcoming)
 
 on:
     schedule:
