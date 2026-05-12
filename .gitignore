@@ -10,10 +10,12 @@ wheels/
 .venv
 
 # SQLite
-*.db*
+*.db
+*.db-shm
+*.db-wal
 
-# Hishel HTTP cache
-.cache/
+# Datasette
+data/inspect.json
 
-# Scraper data directory (DB is persisted via GitHub Actions artifacts)
-data/*.db
+# Generated CSVs
+*.csv
