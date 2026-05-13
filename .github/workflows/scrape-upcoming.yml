@@ -20,6 +20,8 @@ jobs:
             - uses: actions/checkout@v6
 
             - uses: astral-sh/setup-uv@v6
+              with:
+                  cache-dependency-glob: scrape.py
 
             - name: Get latest artifact run id
               env:
