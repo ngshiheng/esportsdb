@@ -25,5 +25,4 @@ test:   ## run unit tests.
 datasette:  ## run datasette with optimizations.
 	@[ -f $(SQLITE_FILE) ] && echo "File $(SQLITE_FILE) exists." || { echo "File $(SQLITE_FILE) does not exist." >&2; exit 1; }
 	@if [ -z $(DATASETTE) ]; then echo "Datasette could not be found. See https://docs.datasette.io/en/stable/installation.html"; exit 2; fi
-	@if [ ! -f data/inspect.json ]; then $(MAKE) inspect; fi
-	@$(DATASETTE) -i $(SQLITE_FILE) --inspect-file=data/inspect.json --setting allow_download off --setting allow_csv_stream off --setting max_csv_mb 1 --setting default_cache_ttl 86400 --setting sql_time_limit_ms 2000 --metadata data/metadata.json --root
+	@$(DATASETTE) -i $(SQLITE_FILE) --setting allow_download off --setting allow_csv_stream off --setting max_csv_mb 1 --setting default_cache_ttl 86400 --setting sql_time_limit_ms 2000 --metadata data/metadata.json --root
