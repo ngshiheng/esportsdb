@@ -235,7 +235,6 @@ class PandaScoreClient:
         response = self._http.get(
             url,
             params=self._page_params(page_number, endpoint),
-            timeout=30.0,
         )
         if response.status_code == 429:
             raise RateLimitError(f"429 on /{endpoint} page {page_number}")
@@ -271,10 +270,14 @@ class PandaScoreClient:
         response = self._http.get(
             url,
             params={"page[number]": 1, "page[size]": 1, "sort": "id"},
-            timeout=30.0,
         )
         response.raise_for_status()
         raw = response.headers.get("X-Total")
+
+        from_cache = bool(response.extensions.get("hishel_from_cache"))
+        if from_cache:
+            log.info("/%s served from cache", endpoint)
+
         return int(raw) if raw is not None else None
 
     def fetch_all(self, endpoint: str) -> Iterator[list[dict[str, Any]]]:
@@ -767,6 +770,7 @@ def run_scrape(config: ScraperConfig) -> None:
             if cfg is None:
                 log.warning("Unknown resource '%s' — skipping.", resource)
                 continue
+
             cfg = dict(cfg)  # copy — avoid mutating the module-level dict
             endpoint = cfg.pop("endpoint", resource)
             log.info("  Scraping /%s ...", endpoint)
