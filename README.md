@@ -149,12 +149,12 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 
 ## Rate Limiting & Caching
 
-| Setting          | Value                      | Notes                                                                                                                   |
-| ---------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Inter-page delay | 5.0 s (3.0 s for backfill) | Keeps throughput ~720 req/hr vs 1,000/hr limit                                                                          |
-| HTTP cache TTL   | None (no expiry)           | `hishel` SQLite-backed cache — entries persist until manually cleared; `FilterPolicy` ignores server expiration headers |
-| Max retries      | 5                          | Exponential backoff on `httpx.RequestError` and HTTP 429                                                                |
-| Backoff factor   | 2.0 s initial              | `tenacity` `wait_exponential`, min 2 s, max 60 s                                                                        |
+| Setting          | Value                      | Notes                                                                                                                                                                                   |
+| ---------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inter-page delay | 5.0 s (3.0 s for backfill) | Keeps throughput ~720 req/hr vs 1,000/hr limit                                                                                                                                          |
+| HTTP cache TTL   | None (no expiry)           | `hishel` SQLite-backed cache — entries persist until manually cleared; only HTTP 200 responses are stored (`_SuccessOnlyFilter`), so transient 5xx errors are never replayed from cache |
+| Max retries      | 5                          | Exponential backoff on `httpx.RequestError`, HTTP 429, and HTTP 5xx                                                                                                                     |
+| Backoff factor   | 2.0 s initial              | `tenacity` `wait_exponential`, min 2 s, max 60 s                                                                                                                                        |
 
 ## Secrets required
 
