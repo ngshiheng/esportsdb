@@ -15,7 +15,6 @@ Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
     ./scrape.py
-    ./scrape.py --db /data/esports.db
     ./scrape.py --resource leagues --resource teams --resource players
 
     # Incremental matches only (last 48 hours):
@@ -47,7 +46,7 @@ import time
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Generator
+from typing import Annotated, Any, Callable, Iterator
 
 import httpx
 import typer
@@ -86,6 +85,7 @@ ALL_RESOURCES = (
     "players",
 )
 
+
 # FK dependency graph: if you request a child resource without its parents in
 # the same run, the parent tables must already be populated in the database.
 # scrape-slow handles full historical rescrape; scrape-fast handles upcoming/running
@@ -123,12 +123,13 @@ class ServerError(Exception):
 
 
 def _before_sleep(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception()
+    exc = retry_state.outcome.exception() if retry_state.outcome is not None else None
     args = retry_state.args
     endpoint = args[1] if len(args) > 1 else "?"
     page_number = args[2] if len(args) > 2 else "?"
     wait = retry_state.upcoming_sleep
     tries = retry_state.attempt_number
+
     if isinstance(exc, RateLimitError):
         log.warning(
             "Rate limited on /%s page %d (attempt %d) — backing off %.1fs.",
@@ -146,6 +147,14 @@ def _before_sleep(retry_state: RetryCallState) -> None:
             wait,
             exc,
         )
+
+
+@dataclass(frozen=True)
+class PageResult:
+    """Page result from scraping"""
+
+    records: list[dict[str, Any]]
+    from_cache: bool
 
 
 @dataclass(frozen=True)
@@ -202,6 +211,11 @@ class PandaScoreClient:
         )
 
     def close(self) -> None:
+        """Close the underlying HTTP client.
+
+        Called automatically by ``contextlib.closing()`` when used as:
+        ``with closing(PandaScoreClient(...)) as client``.
+        """
         self._http.close()
 
     def _page_params(self, page_number: int, endpoint: str) -> dict[str, Any]:
@@ -221,9 +235,7 @@ class PandaScoreClient:
         before_sleep=_before_sleep,
         reraise=True,
     )
-    def _fetch_page_with_retry(
-        self, endpoint: str, page_number: int
-    ) -> tuple[list[dict[str, Any]], bool]:
+    def _fetch_page_with_retry(self, endpoint: str, page_number: int) -> PageResult:
         url = f"{PANDASCORE_BASE_URL}/{endpoint}"
         response = self._http.get(
             url,
@@ -243,6 +255,7 @@ class PandaScoreClient:
 
         try:
             response.raise_for_status()
+
         except httpx.HTTPStatusError as exc:
             log.error("HTTP %d on /%s: %s", exc.response.status_code, endpoint, exc)
             raise
@@ -251,7 +264,7 @@ class PandaScoreClient:
         if from_cache:
             log.info("/%s page %d served from cache", endpoint, page_number)
 
-        return response.json(), from_cache
+        return PageResult(records=response.json(), from_cache=from_cache)
 
     def fetch_total(self, endpoint: str) -> int | None:
         """Return the total record count for an endpoint via X-Total header.
@@ -269,31 +282,32 @@ class PandaScoreClient:
         raw = response.headers.get("X-Total")
         return int(raw) if raw is not None else None
 
-    def fetch_all(self, endpoint: str) -> Generator[list[dict[str, Any]], None, None]:
+    def fetch_all(self, endpoint: str) -> Iterator[list[dict[str, Any]]]:
         """Yield one page at a time; caller commits after each batch."""
         page_number = 1
         while True:
-            records, from_cache = self._fetch_page_with_retry(endpoint, page_number)
-            if not records:
+            result = self._fetch_page_with_retry(endpoint, page_number)
+            if not result.records:
                 break
             if self.since and endpoint == "matches":
                 # Sort is -begin_at (newest first); stop once records go before cutoff
                 filtered = [
                     r
-                    for r in records
+                    for r in result.records
                     if r.get("begin_at") and r["begin_at"] >= self.since
                 ]
                 if filtered:
                     yield filtered
-                if len(filtered) < len(records):
+                if len(filtered) < len(result.records):
                     break
             else:
-                yield records
-            if len(records) < self.page_size:
+                yield result.records
+            if len(result.records) < self.page_size:
                 break
             page_number += 1
+
             # Cache hits are instant — no need to throttle against the API rate limit.
-            if not from_cache:
+            if not result.from_cache:
                 time.sleep(self.page_delay)
 
 
@@ -451,6 +465,11 @@ class Database:
         self._connection.commit()
 
     def close(self) -> None:
+        """Close the underlying SQLite connection.
+
+        Called automatically by ``contextlib.closing()`` when used as:
+        ``with closing(Database(...)) as db``.
+        """
         self._connection.close()
 
 
@@ -553,6 +572,7 @@ def match_opponent_rows(match_record: dict[str, Any]) -> list[dict[str, Any]]:
         opponent_id = opponent.get("id")
         if opponent_id is None:
             continue
+
         rows.append(
             {
                 "match_id": match_id,
@@ -599,9 +619,9 @@ def scrape_resource(
     client: PandaScoreClient,
     db: Database,
     endpoint: str,
-    to_row: Any,
+    to_row: Callable[[dict[str, Any]], dict[str, Any]],
     table: str,
-    extra_rows_fn: Any = None,
+    extra_rows_fn: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     skip_fk_errors: bool = False,
 ) -> int:
     """Page through one endpoint, upsert rows, and commit after each page.
@@ -620,8 +640,10 @@ def scrape_resource(
         for page in client.fetch_all(endpoint):
             for record in page:
                 row = to_row(record)
+
                 try:
                     db.upsert(table, row)
+
                 except sqlite3.IntegrityError as exc:
                     log.error(
                         "FK violation upserting into '%s' (record id=%s): %s\n  row: %s",
@@ -633,10 +655,12 @@ def scrape_resource(
                     if skip_fk_errors:
                         continue
                     raise
+
                 if extra_rows_fn:
                     for extra_row in extra_rows_fn(record):
                         try:
                             db.upsert("match_opponents", extra_row)
+
                         except sqlite3.IntegrityError as exc:
                             log.error(
                                 "FK violation upserting into 'match_opponents' "
@@ -650,6 +674,7 @@ def scrape_resource(
                             raise
             db.commit()
             total += len(page)
+
     except (RateLimitError, ServerError) as exc:
         log.warning(
             "Request failed on /%s after %d records — saving partial progress: %s",
@@ -765,6 +790,7 @@ def _parse_since(value: str) -> str:
         amount, unit = int(m.group(1)), m.group(2)
         delta = timedelta(hours=amount) if unit == "h" else timedelta(days=amount)
         return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     return value
 
 
@@ -859,14 +885,14 @@ def main(
         ),
     ] = False,
 ) -> None:
+    """Entrypoint."""
+    api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("Error: PANDASCORE_API_KEY environment variable is not set.")
+
     resources = resource or list(ALL_RESOURCES)
 
     if count:
-        api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
-        if not api_key:
-            raise SystemExit(
-                "Error: PANDASCORE_API_KEY environment variable is not set."
-            )
         with closing(PandaScoreClient(api_key=api_key)) as client:
             for res in resources:
                 cfg = RESOURCE_CONFIG.get(res)

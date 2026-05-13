@@ -42,7 +42,9 @@ def test_fetch_all_since_stops_early_when_page_crosses_cutoff():
     ]
 
     with patch.object(
-        client, "_fetch_page_with_retry", return_value=page1
+        client,
+        "_fetch_page_with_retry",
+        return_value=main.PageResult(records=page1, from_cache=False),
     ) as mock_fetch:
         results = list(client.fetch_all("matches"))
 
@@ -70,7 +72,9 @@ def test_fetch_all_since_yields_nothing_when_all_records_before_cutoff():
     ]
 
     with patch.object(
-        client, "_fetch_page_with_retry", return_value=page1
+        client,
+        "_fetch_page_with_retry",
+        return_value=main.PageResult(records=page1, from_cache=False),
     ) as mock_fetch:
         results = list(client.fetch_all("matches"))
 
@@ -92,7 +96,11 @@ def test_fetch_all_since_silently_drops_records_missing_begin_at():
         {"id": 3},  # key absent — silently dropped
     ]
 
-    with patch.object(client, "_fetch_page_with_retry", return_value=page1):
+    with patch.object(
+        client,
+        "_fetch_page_with_retry",
+        return_value=main.PageResult(records=page1, from_cache=False),
+    ):
         results = list(client.fetch_all("matches"))
 
     assert results == [[{"id": 1, "begin_at": "2025-01-12T00:00:00Z"}]]
@@ -109,7 +117,12 @@ def test_fetch_all_no_since_yields_all_pages_and_stops_on_partial():
     partial_page = [{"id": 4}]  # 1 record < page_size → last page
 
     with patch.object(
-        client, "_fetch_page_with_retry", side_effect=[full_page, partial_page]
+        client,
+        "_fetch_page_with_retry",
+        side_effect=[
+            main.PageResult(records=full_page, from_cache=False),
+            main.PageResult(records=partial_page, from_cache=False),
+        ],
     ) as mock_fetch:
         results = list(client.fetch_all("leagues"))
 
