@@ -34,16 +34,19 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Iterator
 
 import httpx
 import typer
-from hishel import FilterPolicy, SyncSqliteStorage
+from hishel import BaseFilter, FilterPolicy, SyncSqliteStorage
+from hishel._policies import Response as HishelResponse
 from hishel.httpx import SyncCacheClient
 from tenacity import (
     RetryCallState,
@@ -114,6 +117,20 @@ class RateLimitError(Exception):
 
 class ServerError(Exception):
     """Raised when PandaScore returns a 5xx so tenacity can retry it."""
+
+
+class _SuccessOnlyFilter(BaseFilter[HishelResponse]):
+    """Only allow HTTP 200 responses into the cache.
+
+    Without this, transient 5xx responses would be stored and served on every
+    retry, making tenacity retry against a cached error instead of the real API.
+    """
+
+    def needs_body(self) -> bool:
+        return False
+
+    def apply(self, item: HishelResponse, body: bytes | None) -> bool:
+        return item.status_code == 200
 
 
 def _before_sleep(retry_state: RetryCallState) -> None:
@@ -197,8 +214,10 @@ class PandaScoreClient:
         # FilterPolicy: bypasses HTTP spec checks (PandaScore sends
         # Cache-Control: no-store) so responses are cached and served
         # regardless of server expiration directives.
+        # _SuccessOnlyFilter: prevents error responses (5xx, 429) from being
+        # stored in the cache — retries must always hit the real API.
         storage = SyncSqliteStorage(default_ttl=None)
-        policy = FilterPolicy()
+        policy = FilterPolicy(response_filters=[_SuccessOnlyFilter()])
         self._http = SyncCacheClient(
             storage=storage,
             policy=policy,
@@ -686,61 +705,70 @@ def scrape_resource(
     return total
 
 
-RESOURCE_CONFIG: dict[str, dict[str, Any]] = {
-    "videogames": {"table": "videogames", "to_row": videogame_to_row},
-    "leagues": {"table": "leagues", "to_row": league_to_row},
-    "series": {"table": "series", "to_row": series_to_row},
-    "series_upcoming": {
-        "endpoint": "series/upcoming",
-        "table": "series",
-        "to_row": series_to_row,
-        "skip_fk_errors": True,
-    },
-    "series_running": {
-        "endpoint": "series/running",
-        "table": "series",
-        "to_row": series_to_row,
-        "skip_fk_errors": True,
-    },
-    "tournaments": {
-        "table": "tournaments",
-        "to_row": tournament_to_row,
-        "skip_fk_errors": True,
-    },
-    "tournaments_upcoming": {
-        "endpoint": "tournaments/upcoming",
-        "table": "tournaments",
-        "to_row": tournament_to_row,
-        "skip_fk_errors": True,
-    },
-    "tournaments_running": {
-        "endpoint": "tournaments/running",
-        "table": "tournaments",
-        "to_row": tournament_to_row,
-        "skip_fk_errors": True,
-    },
-    "matches": {
-        "table": "matches",
-        "to_row": match_to_row,
-        "extra_rows_fn": match_opponent_rows,
-        "skip_fk_errors": True,
-    },
-    "matches_upcoming": {
-        "endpoint": "matches/upcoming",
-        "table": "matches",
-        "to_row": match_to_row,
-        "extra_rows_fn": match_opponent_rows,
-        "skip_fk_errors": True,
-    },
-    "matches_running": {
-        "endpoint": "matches/running",
-        "table": "matches",
-        "to_row": match_to_row,
-        "extra_rows_fn": match_opponent_rows,
-        "skip_fk_errors": True,
-    },
-    "teams": {"table": "teams", "to_row": team_to_row},
-    "players": {"table": "players", "to_row": player_to_row},
+@dataclass(frozen=True)
+class ResourceConfig:
+    table: str
+    to_row: Callable[[dict[str, Any]], dict[str, Any]]
+    endpoint: str | None = None
+    extra_rows_fn: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
+    skip_fk_errors: bool = False
+
+
+RESOURCE_CONFIG: dict[str, ResourceConfig] = {
+    "videogames": ResourceConfig(table="videogames", to_row=videogame_to_row),
+    "leagues": ResourceConfig(table="leagues", to_row=league_to_row),
+    "series": ResourceConfig(table="series", to_row=series_to_row),
+    "series_upcoming": ResourceConfig(
+        endpoint="series/upcoming",
+        table="series",
+        to_row=series_to_row,
+        skip_fk_errors=True,
+    ),
+    "series_running": ResourceConfig(
+        endpoint="series/running",
+        table="series",
+        to_row=series_to_row,
+        skip_fk_errors=True,
+    ),
+    "tournaments": ResourceConfig(
+        table="tournaments",
+        to_row=tournament_to_row,
+        skip_fk_errors=True,
+    ),
+    "tournaments_upcoming": ResourceConfig(
+        endpoint="tournaments/upcoming",
+        table="tournaments",
+        to_row=tournament_to_row,
+        skip_fk_errors=True,
+    ),
+    "tournaments_running": ResourceConfig(
+        endpoint="tournaments/running",
+        table="tournaments",
+        to_row=tournament_to_row,
+        skip_fk_errors=True,
+    ),
+    "matches": ResourceConfig(
+        table="matches",
+        to_row=match_to_row,
+        extra_rows_fn=match_opponent_rows,
+        skip_fk_errors=True,
+    ),
+    "matches_upcoming": ResourceConfig(
+        endpoint="matches/upcoming",
+        table="matches",
+        to_row=match_to_row,
+        extra_rows_fn=match_opponent_rows,
+        skip_fk_errors=True,
+    ),
+    "matches_running": ResourceConfig(
+        endpoint="matches/running",
+        table="matches",
+        to_row=match_to_row,
+        extra_rows_fn=match_opponent_rows,
+        skip_fk_errors=True,
+    ),
+    "teams": ResourceConfig(table="teams", to_row=team_to_row),
+    "players": ResourceConfig(table="players", to_row=player_to_row),
 }
 
 
@@ -771,10 +799,17 @@ def run_scrape(config: ScraperConfig) -> None:
                 log.warning("Unknown resource '%s' — skipping.", resource)
                 continue
 
-            cfg = dict(cfg)  # copy — avoid mutating the module-level dict
-            endpoint = cfg.pop("endpoint", resource)
+            endpoint = cfg.endpoint or resource
             log.info("  Scraping /%s ...", endpoint)
-            count = scrape_resource(client, db, endpoint=endpoint, **cfg)
+            count = scrape_resource(
+                client,
+                db,
+                endpoint=endpoint,
+                table=cfg.table,
+                to_row=cfg.to_row,
+                extra_rows_fn=cfg.extra_rows_fn,
+                skip_fk_errors=cfg.skip_fk_errors,
+            )
             log.info("    → %d records upserted.", count)
 
     log.info("Scrape complete in %.1fs.", time.monotonic() - started_at)
@@ -784,9 +819,6 @@ def _parse_since(value: str) -> str:
     """Convert a human-friendly shorthand (e.g. ``48h``, ``7d``) to an
     ISO-8601 UTC datetime string, or return the value unchanged if it is
     already an ISO-8601 string."""
-    import re
-    from datetime import datetime, timedelta, timezone
-
     m = re.fullmatch(r"(\d+)([hd])", value.strip())
     if m:
         amount, unit = int(m.group(1)), m.group(2)
@@ -797,16 +829,13 @@ def _parse_since(value: str) -> str:
 
 
 def _build_config(
+    api_key: str,
     db: Path,
     resources: list[str],
     page_size: int,
     since: str | None,
     page_delay: float,
 ) -> ScraperConfig:
-    api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("Error: PANDASCORE_API_KEY environment variable is not set.")
-
     unknown = set(resources) - set(ALL_RESOURCES)
     if unknown:
         log.warning("Unrecognised resources will be skipped: %s", unknown)
@@ -902,7 +931,7 @@ def main(
                     log.info("%s: unknown resource", res)
                     continue
 
-                endpoint = cfg.get("endpoint", res)
+                endpoint = cfg.endpoint or res
                 total = client.fetch_total(endpoint)
                 pages = ((total - 1) // DEFAULT_PAGE_SIZE + 1) if total else "?"
                 delay_min = (
@@ -919,7 +948,7 @@ def main(
 
         return
 
-    run_scrape(_build_config(db, resources, page_size, since, page_delay))
+    run_scrape(_build_config(api_key, db, resources, page_size, since, page_delay))
 
 
 if __name__ == "__main__":
