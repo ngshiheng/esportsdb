@@ -15,7 +15,7 @@ Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
     ./scrape.py
-    ./scrape.py --resource leagues --resource teams --resource players
+    ./scrape.py --resource videogames
 
     # Incremental matches only (last 48 hours):
     ./scrape.py --resource matches --since 48h
@@ -25,13 +25,6 @@ Usage:
 
     # Print record counts without scraping:
     ./scrape.py --count
-
-Cron examples:
-    # Slow tables — full rescrape once daily (~304 req, ~20 min)
-    0 2 * * *   PANDASCORE_API_KEY=sk-xxx ./scrape.py --resource videogames --resource leagues --resource series --resource tournaments --resource teams --resource players
-
-    # Fast table — incremental every 2 hours (~5 req/run)
-    0 */2 * * * PANDASCORE_API_KEY=sk-xxx ./scrape.py --resource matches --since 48h
 
 Rate budget: default --page-delay of 5.0s keeps throughput at ~720 req/hr (limit: 1,000/hr).
 HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run immediately.
@@ -68,6 +61,7 @@ INITIAL_BACKOFF_SECONDS = 2.0
 INTER_PAGE_DELAY_SECONDS = (
     5.0  # keeps throughput ~720 req/hr, well under the 1k/hr limit
 )
+
 
 ALL_RESOURCES = (
     "videogames",
@@ -138,6 +132,7 @@ def _before_sleep(retry_state: RetryCallState) -> None:
             tries,
             wait,
         )
+
     else:
         log.warning(
             "Request error on /%s page %d (attempt %d) — backing off %.1fs: %s",
@@ -285,10 +280,12 @@ class PandaScoreClient:
     def fetch_all(self, endpoint: str) -> Iterator[list[dict[str, Any]]]:
         """Yield one page at a time; caller commits after each batch."""
         page_number = 1
+
         while True:
             result = self._fetch_page_with_retry(endpoint, page_number)
             if not result.records:
                 break
+
             if self.since and endpoint == "matches":
                 # Sort is -begin_at (newest first); stop once records go before cutoff
                 filtered = [
@@ -302,6 +299,7 @@ class PandaScoreClient:
                     break
             else:
                 yield result.records
+
             if len(result.records) < self.page_size:
                 break
             page_number += 1
@@ -897,19 +895,24 @@ def main(
             for res in resources:
                 cfg = RESOURCE_CONFIG.get(res)
                 if cfg is None:
-                    print(f"{res}: unknown resource")
+                    log.info("%s: unknown resource", res)
                     continue
+
                 endpoint = cfg.get("endpoint", res)
                 total = client.fetch_total(endpoint)
                 pages = ((total - 1) // DEFAULT_PAGE_SIZE + 1) if total else "?"
                 delay_min = (
                     (pages if isinstance(pages, int) else 0) * INTER_PAGE_DELAY_SECONDS
                 ) / 60
-                print(
-                    f"{endpoint}: {total:,} records  "
-                    f"~{pages} pages  "
-                    f"~{delay_min:.1f} min delay"
+
+                log.info(
+                    "%s: %d records  ~%d pages  ~%.1f min delay",
+                    endpoint,
+                    total,
+                    pages,
+                    delay_min,
                 )
+
         return
 
     run_scrape(_build_config(db, resources, page_size, since, page_delay))
