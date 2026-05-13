@@ -223,7 +223,7 @@ class PandaScoreClient:
     )
     def _fetch_page_with_retry(
         self, endpoint: str, page_number: int
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         url = f"{PANDASCORE_BASE_URL}/{endpoint}"
         response = self._http.get(
             url,
@@ -247,10 +247,11 @@ class PandaScoreClient:
             log.error("HTTP %d on /%s: %s", exc.response.status_code, endpoint, exc)
             raise
 
-        if response.extensions.get("hishel_from_cache"):
+        from_cache = bool(response.extensions.get("hishel_from_cache"))
+        if from_cache:
             log.info("/%s page %d served from cache", endpoint, page_number)
 
-        return response.json()
+        return response.json(), from_cache
 
     def fetch_total(self, endpoint: str) -> int | None:
         """Return the total record count for an endpoint via X-Total header.
@@ -272,7 +273,7 @@ class PandaScoreClient:
         """Yield one page at a time; caller commits after each batch."""
         page_number = 1
         while True:
-            records = self._fetch_page_with_retry(endpoint, page_number)
+            records, from_cache = self._fetch_page_with_retry(endpoint, page_number)
             if not records:
                 break
             if self.since and endpoint == "matches":
@@ -291,7 +292,9 @@ class PandaScoreClient:
             if len(records) < self.page_size:
                 break
             page_number += 1
-            time.sleep(self.page_delay)
+            # Cache hits are instant — no need to throttle against the API rate limit.
+            if not from_cache:
+                time.sleep(self.page_delay)
 
 
 SCHEMA_DDL: tuple[str, ...] = (

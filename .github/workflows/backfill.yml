@@ -45,6 +45,17 @@ jobs:
                   github-token: ${{ github.token }}
               continue-on-error: true
 
+            # Restore the hishel HTTP-response cache so that pages already
+            # fetched in a prior (possibly failed) run replay instantly from
+            # disk, skipping both API calls and the per-page delay.
+            - name: Restore hishel cache
+              id: cache-hishel-restore
+              uses: actions/cache/restore@v5
+              with:
+                  path: .cache/hishel
+                  key: hishel-backfill-${{ github.run_id }}-${{ github.run_attempt }}
+                  restore-keys: hishel-backfill-
+
             - name: Backfill all historical matches
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
@@ -53,6 +64,15 @@ jobs:
                     --db data/esports.db \
                     --resource matches \
                     --page-delay 3
+
+            # Save the hishel cache even on failure so a retry can replay
+            # already-fetched pages without hitting the API again.
+            - name: Save hishel cache
+              if: always()
+              uses: actions/cache/save@v5
+              with:
+                  path: .cache/hishel
+                  key: ${{ steps.cache-hishel-restore.outputs.cache-primary-key }}
 
             - name: Validate DB
               run: |
@@ -64,6 +84,7 @@ jobs:
                   fi
 
             - name: Upload updated DB artifact
+              if: always() && hashFiles('data/esports.db') != ''
               uses: actions/upload-artifact@v7
               with:
                   name: esports-db
