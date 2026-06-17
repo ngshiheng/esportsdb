@@ -5,6 +5,10 @@ on:
         - cron: "0 2 * * *" # Daily at 02:00 UTC
     workflow_dispatch:
 
+env:
+    DB_PATH: data/esports.db
+    ARTIFACT_NAME: esports-db
+
 concurrency:
     group: esports-db-artifact
     cancel-in-progress: false
@@ -12,6 +16,7 @@ concurrency:
 jobs:
     scrape:
         runs-on: ubuntu-latest
+        timeout-minutes: 90
         permissions:
             actions: read
             contents: read
@@ -28,24 +33,24 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -euo pipefail
-                  # Resolve the run that produced the most recent esports-db artifact so
+                  # Resolve the run that produced the most recent DB artifact so
                   # the DB accumulates across runs rather than starting fresh each time.
                   run_id=$(gh api \
-                    "repos/${{ github.repository }}/actions/artifacts?name=esports-db&per_page=1" \
+                    "repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
                     --jq '.artifacts[0].workflow_run.id // empty')
                   if [[ -n "$run_id" ]]; then
                     echo "artifact_run_id=$run_id" >> "$GITHUB_ENV"
                   fi
 
             - name: Download previous DB artifact
+              if: ${{ env.artifact_run_id != '' }}
               uses: actions/download-artifact@v8
               with:
-                  name: esports-db
+                  name: ${{ env.ARTIFACT_NAME }}
                   path: ./data/
                   run-id: ${{ env.artifact_run_id }}
                   github-token: ${{ github.token }}
-              # First-ever run has no artifact — let the scraper bootstrap a fresh DB.
-              continue-on-error: true
+              continue-on-error: false
 
             - name: Scrape daily resources
               id: scrape
@@ -53,8 +58,9 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
+                  set -euo pipefail
                   uv run scrape.py \
-                    --db data/esports.db \
+                    --db "$DB_PATH" \
                     --resource videogames \
                     --resource leagues \
                     --resource series \
@@ -65,9 +71,16 @@ jobs:
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
             # Runs even when scrape was rate-limited so partial progress is preserved.
             - name: Validate DB
+              id: validate_db
               if: always()
               run: |
-                  COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM players;")
+                  set -euo pipefail
+                  if [ ! -f "$DB_PATH" ]; then
+                    echo "ERROR: $DB_PATH does not exist."
+                    exit 1
+                  fi
+
+                  COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM players;")
                   echo "players row count: $COUNT"
                   if [ "$COUNT" -lt 100 ]; then
                     echo "ERROR: players count $COUNT is below threshold. Aborting upload."
@@ -75,13 +88,13 @@ jobs:
                   fi
 
             - name: Upload updated DB artifact
-              if: always()
+              if: ${{ always() && steps.validate_db.outcome == 'success' }}
               uses: actions/upload-artifact@v7
               with:
-                  name: esports-db
-                  path: data/esports.db
+                  name: ${{ env.ARTIFACT_NAME }}
+                  path: ${{ env.DB_PATH }}
                   if-no-files-found: error
-                  retention-days: 90
+                  retention-days: 1
 
             - name: Install datasette
               run: pipx install datasette
@@ -101,8 +114,15 @@ jobs:
     deploy:
         needs: scrape
         runs-on: ubuntu-latest
+        timeout-minutes: 15
         permissions:
             contents: read
+        env:
+            RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+            RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+            RAILWAY_ENVIRONMENT_ID: ${{ secrets.RAILWAY_ENVIRONMENT_ID }}
+            RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+            RAILWAY_API_URL: https://backboard.railway.app/graphql/v2
         steps:
             - name: Check out this repo
               uses: actions/checkout@v6
@@ -110,14 +130,22 @@ jobs:
             - name: Get Latest Deployment ID
               id: get-deployment
               run: |
+                  set -euo pipefail
+                  for secret_name in RAILWAY_TOKEN RAILWAY_PROJECT_ID RAILWAY_ENVIRONMENT_ID RAILWAY_SERVICE_ID; do
+                    if [[ -z "${!secret_name}" ]]; then
+                      echo "ERROR: $secret_name is empty."
+                      exit 1
+                    fi
+                  done
+
                   echo "Fetching latest deployment ID..."
-                  RESPONSE=$(curl --fail-with-body -s -X POST \
+                  RESPONSE=$(curl --fail-with-body -sS --retry 5 --retry-all-errors --retry-delay 2 -X POST \
                     -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+                    -H "Authorization: Bearer $RAILWAY_TOKEN" \
                     -H "User-Agent: GitHub-Actions" \
-                    --url https://backboard.railway.app/graphql/v2 \
+                    --url "$RAILWAY_API_URL" \
                     -d '{
-                      "query": "query deployments { deployments(last: 1, input: { projectId: \"${{ secrets.RAILWAY_PROJECT_ID }}\", environmentId: \"${{ secrets.RAILWAY_ENVIRONMENT_ID }}\", serviceId: \"${{ secrets.RAILWAY_SERVICE_ID }}\", status: { in: [SUCCESS, SLEEPING] } }) { edges { node { id status } } } }",
+                      "query": "query deployments { deployments(last: 10, input: { projectId: \"'"$RAILWAY_PROJECT_ID"'\", environmentId: \"'"$RAILWAY_ENVIRONMENT_ID"'\", serviceId: \"'"$RAILWAY_SERVICE_ID"'\" }) { edges { node { id status } } } }",
                       "operationName": "deployments"
                     }')
 
@@ -129,18 +157,23 @@ jobs:
                     exit 1
                   fi
 
-                  DEPLOYMENT_ID=$(echo "$RESPONSE" | jq -r '.data.deployments.edges[0].node.id')
+                  DEPLOYMENT_ID=$(echo "$RESPONSE" | jq -r '.data.deployments.edges[].node | select(.status != "REMOVED") | .id' | head -n1)
+                  if [[ -z "$DEPLOYMENT_ID" ]]; then
+                    echo "ERROR: No active deployment found. Check Railway IDs or create a successful deployment first."
+                    exit 1
+                  fi
                   echo "Found deployment ID: $DEPLOYMENT_ID"
                   echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
 
             - name: Trigger redeployment
               run: |
+                  set -euo pipefail
                   echo "Triggering redeployment for ID: ${{ steps.get-deployment.outputs.deployment_id }}"
-                  RESPONSE=$(curl --fail-with-body -s -X POST \
+                  RESPONSE=$(curl --fail-with-body -sS --retry 5 --retry-all-errors --retry-delay 2 -X POST \
                     -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer ${{ secrets.RAILWAY_TOKEN }}" \
+                    -H "Authorization: Bearer $RAILWAY_TOKEN" \
                     -H "User-Agent: GitHub-Actions" \
-                    --url https://backboard.railway.app/graphql/v2 \
+                    --url "$RAILWAY_API_URL" \
                     -d "{
                       \"query\": \"mutation { deploymentRedeploy(id: \\\"${{ steps.get-deployment.outputs.deployment_id }}\\\", usePreviousImageTag: true) { id status } }\"
                     }")
@@ -152,3 +185,10 @@ jobs:
                     echo "Error in API response"
                     exit 1
                   fi
+
+                  NEW_DEPLOYMENT_ID=$(echo "$RESPONSE" | jq -r '.data.deploymentRedeploy.id // empty')
+                  if [[ -z "$NEW_DEPLOYMENT_ID" ]]; then
+                    echo "ERROR: Railway redeploy did not return a deployment id."
+                    exit 1
+                  fi
+                  echo "Redeploy accepted: $NEW_DEPLOYMENT_ID"
