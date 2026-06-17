@@ -99,4 +99,4 @@ jobs:
                   name: esports-db
                   path: data/esports.db
                   if-no-files-found: error
-                  retention-days: 90
+                  retention-days: 1
