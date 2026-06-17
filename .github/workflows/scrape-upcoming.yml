@@ -5,6 +5,10 @@ on:
         - cron: "0 */2 * * *" # Every 2 hours
     workflow_dispatch:
 
+env:
+    DB_PATH: data/esports.db
+    ARTIFACT_NAME: esports-db
+
 concurrency:
     group: esports-db-artifact
     cancel-in-progress: false
@@ -28,19 +32,20 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -euo pipefail
-                  # Resolve the run that produced the most recent esports-db artifact so
+                  # Resolve the run that produced the most recent DB artifact so
                   # the DB accumulates across runs rather than starting fresh each time.
                   run_id=$(gh api \
-                    "repos/${{ github.repository }}/actions/artifacts?name=esports-db&per_page=1" \
+                    "repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
                     --jq '.artifacts[0].workflow_run.id // empty')
                   if [[ -n "$run_id" ]]; then
                     echo "artifact_run_id=$run_id" >> "$GITHUB_ENV"
                   fi
 
             - name: Download previous DB artifact
+              if: ${{ env.artifact_run_id != '' }}
               uses: actions/download-artifact@v8
               with:
-                  name: esports-db
+                  name: ${{ env.ARTIFACT_NAME }}
                   path: ./data/
                   run-id: ${{ env.artifact_run_id }}
                   github-token: ${{ github.token }}
@@ -51,8 +56,9 @@ jobs:
 
             - name: Validate parent tables are populated
               run: |
+                  set -euo pipefail
                   for table in videogames leagues series tournaments; do
-                    COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM $table;")
+                    COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM $table;")
                     echo "$table row count: $COUNT"
                     if [ "$COUNT" -lt 1 ]; then
                       echo "ERROR: $table is empty. Run scrape-slow first to populate parent tables."
@@ -64,8 +70,9 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
+                  set -euo pipefail
                   uv run scrape.py \
-                    --db data/esports.db \
+                    --db "$DB_PATH" \
                     --resource series_upcoming \
                     --resource series_running \
                     --resource tournaments_upcoming \
@@ -77,8 +84,9 @@ jobs:
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
               run: |
+                  set -euo pipefail
                   uv run scrape.py \
-                    --db data/esports.db \
+                    --db "$DB_PATH" \
                     --resource matches \
                     --since 48h
 
@@ -86,7 +94,13 @@ jobs:
             # the scraper failed silently or the DB was not downloaded correctly.
             - name: Validate DB
               run: |
-                  COUNT=$(sqlite3 data/esports.db "SELECT COUNT(*) FROM matches;")
+                  set -euo pipefail
+                  if [ ! -f "$DB_PATH" ]; then
+                    echo "ERROR: $DB_PATH does not exist. Aborting upload."
+                    exit 1
+                  fi
+
+                  COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM matches;")
                   echo "matches row count: $COUNT"
                   if [ "$COUNT" -lt 1 ]; then
                     echo "ERROR: matches table is empty. Aborting upload."
@@ -96,7 +110,7 @@ jobs:
             - name: Upload updated DB artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: esports-db
-                  path: data/esports.db
+                  name: ${{ env.ARTIFACT_NAME }}
+                  path: ${{ env.DB_PATH }}
                   if-no-files-found: error
                   retention-days: 1
