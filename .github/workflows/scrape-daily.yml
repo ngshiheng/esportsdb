@@ -157,7 +157,7 @@ jobs:
                     exit 1
                   fi
 
-                  DEPLOYMENT_ID=$(echo "$RESPONSE" | jq -r '.data.deployments.edges[].node | select(.status != "REMOVED") | .id' | head -n1)
+                  DEPLOYMENT_ID=$(echo "$RESPONSE" | jq -r '.data.deployments.edges[].node | select(.status == "SUCCESS" or .status == "SLEEPING") | .id' | head -n1)
                   if [[ -z "$DEPLOYMENT_ID" ]]; then
                     echo "ERROR: No active deployment found. Check Railway IDs or create a successful deployment first."
                     exit 1
