@@ -14,14 +14,15 @@ PandaScore periodic scraper — populates a local SQLite database.
 Set PANDASCORE_API_KEY in your environment before running.
 
 Usage:
-    ./scrape.py
-    ./scrape.py --resource videogames
+    make scrape-fast          # every-2h refresh: live/upcoming + last 48 h of matches
+    make scrape-slow          # daily refresh: reference data (leagues, series, tournaments, teams, players)
+    make scrape-history       # one-time full historical match backfill (run manually once)
+
+    # Or invoke directly:
+    ./scrape.py --resource matches_upcoming --resource matches_running
 
     # Incremental matches only (last 48 hours):
     ./scrape.py --resource matches --since 48h
-
-    # Historical backfill (one-time, safe to Ctrl-C and re-run):
-    ./scrape.py --resource matches
 
     # Print record counts without scraping:
     ./scrape.py --count

@@ -1,4 +1,4 @@
-name: Scrape (historical backfill)
+name: Scrape (history)
 
 # Triggered manually ONLY. Never scheduled — this run takes ~2.5 hours.
 on:
@@ -13,7 +13,7 @@ concurrency:
     cancel-in-progress: false
 
 jobs:
-    backfill:
+    history:
         runs-on: ubuntu-latest
         # Full matches sweep: ~2534 pages × 3s delay ≈ 2.5h; add headroom.
         timeout-minutes: 360
@@ -24,7 +24,8 @@ jobs:
         steps:
             - uses: actions/checkout@v7
 
-            - uses: astral-sh/setup-uv@v8.1.0
+            - name: Set up uv
+              uses: astral-sh/setup-uv@v8.1.0
               with:
                   cache-dependency-glob: scrape.py
 
@@ -42,7 +43,7 @@ jobs:
                     echo "artifact_run_id=$run_id" >> "$GITHUB_ENV"
                   fi
 
-            - name: Download previous DB artifact
+            - name: Download DB artifact
               if: ${{ env.artifact_run_id != '' }}
               uses: actions/download-artifact@v8
               with:
@@ -63,15 +64,10 @@ jobs:
                   key: hishel-backfill-${{ github.run_id }}-${{ github.run_attempt }}
                   restore-keys: hishel-backfill-
 
-            - name: Backfill all historical matches
+            - name: Run scrape-history
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
-              run: |
-                  set -euo pipefail
-                  uv run scrape.py \
-                    --db "$DB_PATH" \
-                    --resource matches \
-                    --page-delay 3
+              run: make scrape-history
 
             # Save the hishel cache even on failure so a retry can replay
             # already-fetched pages without hitting the API again.

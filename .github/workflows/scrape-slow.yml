@@ -1,4 +1,4 @@
-name: Scrape (daily)
+name: Scrape (slow)
 
 on:
     schedule:
@@ -43,7 +43,7 @@ jobs:
                     echo "artifact_run_id=$run_id" >> "$GITHUB_ENV"
                   fi
 
-            - name: Download artifact
+            - name: Download DB artifact
               if: ${{ env.artifact_run_id != '' }}
               uses: actions/download-artifact@v8
               with:
@@ -53,24 +53,11 @@ jobs:
                   github-token: ${{ github.token }}
               continue-on-error: false
 
-            - name: Display downloaded file
-              run: ls -la data
-
-            - name: Scrape daily resources
-              id: scrape
+            - name: Run scrape-slow
               continue-on-error: true
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
-              run: |
-                  set -euo pipefail
-                  uv run scrape.py \
-                    --db "$DB_PATH" \
-                    --resource videogames \
-                    --resource leagues \
-                    --resource series \
-                    --resource tournaments \
-                    --resource teams \
-                    --resource players
+              run: make scrape-slow
 
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
             # Runs even when scrape was rate-limited so partial progress is preserved.

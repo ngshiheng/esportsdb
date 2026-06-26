@@ -23,8 +23,27 @@ setup:    ## setup scraper.
 	@$(UV) export --script scrape.py | $(UV) pip sync -
 
 .PHONY: run
-run:    ## run scraper.
-	@$(UV) run --script scrape.py --db $(SQLITE_FILE)
+run: scrape-fast    ## run scraper (alias for scrape-fast; use scrape-slow for first-time backfill).
+
+.PHONY: scrape-fast
+scrape-fast:    ## refresh live/upcoming data + last 48 h of matches + teams (mirrors scrape-fast.yml).
+	@$(UV) run --script scrape.py --db $(SQLITE_FILE) \
+		--resource series_upcoming --resource series_running \
+		--resource tournaments_upcoming --resource tournaments_running \
+		--resource matches_upcoming --resource matches_running \
+		--resource matches --since 48h \
+		--resource teams
+
+.PHONY: scrape-slow
+scrape-slow:    ## refresh reference data — leagues, series, tournaments, teams, players (mirrors scrape-daily.yml).
+	@$(UV) run --script scrape.py --db $(SQLITE_FILE) \
+		--resource videogames --resource leagues \
+		--resource series --resource tournaments \
+		--resource teams --resource players
+
+.PHONY: scrape-history
+scrape-history:    ## one-time full historical match backfill (slow, hours — run manually once).
+	@$(UV) run --script scrape.py --db $(SQLITE_FILE) --resource matches --page-delay 3
 
 .PHONY: test
 test:   ## run unit tests.
