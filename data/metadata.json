@@ -19,55 +19,68 @@
                     "sql": "SELECT v.name AS game, l.name AS league, l.url, COUNT(DISTINCT s.id) AS series_count FROM leagues l JOIN videogames v ON v.id = l.videogame_id LEFT JOIN series s ON s.league_id = l.id WHERE v.name LIKE '%' || :game || '%' GROUP BY l.id ORDER BY series_count DESC",
                     "params": ["game"]
                 },
-                "top_leagues_by_activity": {
-                    "title": "Most Active Leagues",
-                    "description": "Which leagues have the most series? A ranking of the busiest competitive circuits. Leave Game blank for all titles. Try: Counter-Strike, Valorant, Dota 2.",
-                    "sql": "SELECT l.name AS league, v.name AS game, COUNT(s.id) AS series_count FROM leagues l JOIN videogames v ON v.id = l.videogame_id JOIN series s ON s.league_id = l.id WHERE (:game = '' OR v.name LIKE '%' || :game || '%') GROUP BY l.id ORDER BY series_count DESC LIMIT 50",
-                    "params": ["game"]
-                },
-                "premier_tournaments": {
-                    "title": "Premier (S-Tier) Tournaments",
-                    "description": "The most prestigious events in esports — S-tier only: Majors, Worlds, Grand Finals. Prize pool shown as amount + currency. Leave Game or League blank to skip that filter.",
-                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.begin_at, t.end_at, t.prizepool FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.tier = 's' AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:league = '' OR l.name LIKE '%' || :league || '%') ORDER BY t.begin_at DESC LIMIT 100",
-                    "params": ["game", "league"]
-                },
-
-                "series_by_year": {
-                    "title": "Competitive Seasons by Year",
-                    "description": "All series (competitive seasons) for a given year. Leave Game blank for all titles. Try: year = 2024, game = Valorant.",
-                    "sql": "SELECT s.full_name AS series, v.name AS game, l.name AS league, s.season, s.begin_at, s.end_at, (SELECT COUNT(*) FROM tournaments WHERE serie_id = s.id) AS tournament_count FROM series s JOIN videogames v ON v.id = s.videogame_id JOIN leagues l ON l.id = s.league_id WHERE s.year = cast(:year as integer) AND (:game = '' OR v.name LIKE '%' || :game || '%') ORDER BY v.name, l.name, s.begin_at",
-                    "params": ["year", "game"]
-                },
-                "league_history": {
-                    "title": "League Season History",
-                    "description": "All series and tournaments ever run under a specific league. Enter a league name (or part of it) to trace its full history.",
-                    "sql": "SELECT l.name AS league, s.year, s.full_name AS series, s.season, s.begin_at, s.end_at, COUNT(t.id) AS tournaments FROM series s JOIN leagues l ON l.id = s.league_id LEFT JOIN tournaments t ON t.serie_id = s.id WHERE l.name LIKE '%' || :league || '%' GROUP BY s.id ORDER BY s.year DESC, s.begin_at DESC",
-                    "params": ["league"]
-                },
-                "tournament_tier_breakdown": {
-                    "title": "Tournament Tiers by Game",
-                    "description": "How many S/A/B/C/D-tier events exist per game? Tiers reflect prestige: S = premier, A = top, B = mid, C/D = regional/open. Leave Game blank for all titles.",
-                    "sql": "SELECT v.name AS game, COALESCE(NULLIF(t.tier, ''), '(none)') AS tier, COUNT(*) AS tournament_count FROM tournaments t JOIN videogames v ON v.id = t.videogame_id WHERE (:game = '' OR v.name LIKE '%' || :game || '%') GROUP BY v.id, tier ORDER BY v.name, CASE tier WHEN 's' THEN 1 WHEN 'a' THEN 2 WHEN 'b' THEN 3 WHEN 'c' THEN 4 WHEN 'd' THEN 5 WHEN 'unranked' THEN 6 ELSE 7 END",
-                    "params": ["game"]
-                },
-
-                "recent_tournaments": {
-                    "title": "Most Recent Tournaments",
-                    "description": "The latest completed tournaments. All filters are optional. Game: Counter-Strike, Valorant… Tier: s, a, b, c, d. League: IEM, VCT, BLAST… Name: partial tournament name.",
-                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.end_at IS NOT NULL AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tier = '' OR t.tier = :tier) AND (:league = '' OR l.name LIKE '%' || :league || '%') AND (:name = '' OR t.name LIKE '%' || :name || '%') ORDER BY t.end_at DESC LIMIT 50",
-                    "params": ["game", "tier", "league", "name"]
-                },
-                "upcoming_tournaments": {
-                    "title": "Upcoming Tournaments",
-                    "description": "Tournaments not yet started, sorted by earliest start date. Leave Game or Tier blank to skip that filter. Game: Counter-Strike, Valorant… Tier: s, a, b, c, d.",
-                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.begin_at > date('now') AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tier = '' OR t.tier = :tier) ORDER BY t.begin_at ASC LIMIT 100",
-                    "params": ["game", "tier"]
-                },
                 "coverage_by_year": {
                     "title": "Historical Coverage by Year",
                     "description": "How many tournaments were recorded per game per year? All filters are optional. Leave blank to see everything.",
                     "sql": "SELECT strftime('%Y', t.begin_at) AS year, v.name AS game, COUNT(*) AS tournaments FROM tournaments t JOIN videogames v ON v.id = t.videogame_id WHERE t.begin_at IS NOT NULL AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:year = '' OR strftime('%Y', t.begin_at) = :year) GROUP BY year, v.id ORDER BY year DESC, tournaments DESC",
                     "params": ["year", "game"]
+                },
+
+                "major_events": {
+                    "title": "Major Events (S-Tier)",
+                    "description": "The most prestigious events in esports — Majors, Worlds, Grand Finals. Leave Game blank for all titles.",
+                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at, CASE t.winner_type WHEN 'team' THEN (SELECT name FROM teams WHERE id = t.winner_id) ELSE NULL END AS winner FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.tier = 's' AND (:game = '' OR v.name LIKE '%' || :game || '%') ORDER BY t.begin_at DESC LIMIT 100",
+                    "params": ["game"]
+                },
+                "ongoing_tournaments": {
+                    "title": "Ongoing Tournaments",
+                    "description": "Tournaments currently in progress. Leave Game blank for all titles. Try: Counter-Strike, Valorant, Dota 2.",
+                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.begin_at <= datetime('now') AND (t.end_at IS NULL OR t.end_at >= datetime('now')) AND (:game = '' OR v.name LIKE '%' || :game || '%') ORDER BY t.tier, t.begin_at ASC LIMIT 50",
+                    "params": ["game"]
+                },
+                "upcoming_tournaments": {
+                    "title": "Upcoming Tournaments",
+                    "description": "Tournaments not yet started, sorted by earliest start date. Leave Game or Tier blank to skip that filter. Game: Counter-Strike, Valorant… Tier: s, a, b, c, d.",
+                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.begin_at > datetime('now') AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tier = '' OR t.tier = :tier) ORDER BY t.begin_at ASC LIMIT 100",
+                    "params": ["game", "tier"]
+                },
+                "completed_tournaments": {
+                    "title": "Completed Tournaments",
+                    "description": "Recently finished tournaments with results. Leave Game or Tier blank to skip that filter. Game: Counter-Strike, Valorant… Tier: s, a, b, c, d.",
+                    "sql": "SELECT t.name, v.name AS game, l.name AS league, t.tier, t.prizepool, t.begin_at, t.end_at, CASE t.winner_type WHEN 'team' THEN (SELECT name FROM teams WHERE id = t.winner_id) ELSE NULL END AS winner FROM tournaments t JOIN videogames v ON v.id = t.videogame_id JOIN leagues l ON l.id = t.league_id WHERE t.end_at < datetime('now') AND t.end_at IS NOT NULL AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tier = '' OR t.tier = :tier) ORDER BY t.end_at DESC LIMIT 50",
+                    "params": ["game", "tier"]
+                },
+
+                "live_matches": {
+                    "title": "Live Matches",
+                    "description": "Matches happening right now. Leave Game blank for all titles. Try: Counter-Strike, Valorant, Dota 2.",
+                    "sql": "SELECT m.begin_at, v.name AS game, l.name AS league, t.name AS tournament, t.tier, m.match_type, m.number_of_games, MAX(CASE WHEN mo_rn.rn = 1 THEN COALESCE(tm.name, p.name) END) AS team_1, MAX(CASE WHEN mo_rn.rn = 2 THEN COALESCE(tm.name, p.name) END) AS team_2, m.live_embed_url FROM matches m JOIN videogames v ON v.id = m.videogame_id JOIN leagues l ON l.id = m.league_id JOIN tournaments t ON t.id = m.tournament_id LEFT JOIN (SELECT match_id, opponent_id, opponent_type, ROW_NUMBER() OVER (PARTITION BY match_id ORDER BY id) AS rn FROM match_opponents) mo_rn ON mo_rn.match_id = m.id LEFT JOIN teams tm ON mo_rn.opponent_id = tm.id AND mo_rn.opponent_type = 'team' LEFT JOIN players p ON mo_rn.opponent_id = p.id AND mo_rn.opponent_type = 'player' WHERE m.status = 'running' AND (:game = '' OR v.name LIKE '%' || :game || '%') GROUP BY m.id ORDER BY m.begin_at ASC",
+                    "params": ["game"]
+                },
+                "upcoming_matches": {
+                    "title": "Upcoming Matches",
+                    "description": "Scheduled matches not yet started, sorted by earliest kick-off. Leave Game or Tier blank to skip that filter. Game: Counter-Strike, Valorant… Tier: s, a, b, c, d.",
+                    "sql": "SELECT m.scheduled_at, v.name AS game, l.name AS league, t.name AS tournament, t.tier, m.match_type, m.number_of_games, MAX(CASE WHEN mo_rn.rn = 1 THEN COALESCE(tm.name, p.name) END) AS team_1, MAX(CASE WHEN mo_rn.rn = 2 THEN COALESCE(tm.name, p.name) END) AS team_2 FROM matches m JOIN videogames v ON v.id = m.videogame_id JOIN leagues l ON l.id = m.league_id JOIN tournaments t ON t.id = m.tournament_id LEFT JOIN (SELECT match_id, opponent_id, opponent_type, ROW_NUMBER() OVER (PARTITION BY match_id ORDER BY id) AS rn FROM match_opponents) mo_rn ON mo_rn.match_id = m.id LEFT JOIN teams tm ON mo_rn.opponent_id = tm.id AND mo_rn.opponent_type = 'team' LEFT JOIN players p ON mo_rn.opponent_id = p.id AND mo_rn.opponent_type = 'player' WHERE m.status = 'not_started' AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tier = '' OR t.tier = :tier) GROUP BY m.id ORDER BY m.scheduled_at ASC LIMIT 100",
+                    "params": ["game", "tier"]
+                },
+                "completed_matches": {
+                    "title": "Completed Matches",
+                    "description": "Recent match results with scores. Leave Game or Tournament blank to skip that filter. Game: Counter-Strike, Valorant… Tournament: partial name, e.g. IEM Katowice.",
+                    "sql": "SELECT m.end_at, v.name AS game, l.name AS league, t.name AS tournament, t.tier, m.match_type, MAX(CASE WHEN mo_rn.rn = 1 THEN COALESCE(tm.name, p.name) END) AS team_1, MAX(CASE WHEN mo_rn.rn = 1 THEN mo_rn.score END) AS score_1, MAX(CASE WHEN mo_rn.rn = 2 THEN COALESCE(tm.name, p.name) END) AS team_2, MAX(CASE WHEN mo_rn.rn = 2 THEN mo_rn.score END) AS score_2 FROM matches m JOIN videogames v ON v.id = m.videogame_id JOIN leagues l ON l.id = m.league_id JOIN tournaments t ON t.id = m.tournament_id LEFT JOIN (SELECT match_id, opponent_id, opponent_type, score, ROW_NUMBER() OVER (PARTITION BY match_id ORDER BY id) AS rn FROM match_opponents) mo_rn ON mo_rn.match_id = m.id LEFT JOIN teams tm ON mo_rn.opponent_id = tm.id AND mo_rn.opponent_type = 'team' LEFT JOIN players p ON mo_rn.opponent_id = p.id AND mo_rn.opponent_type = 'player' WHERE m.status = 'finished' AND (:game = '' OR v.name LIKE '%' || :game || '%') AND (:tournament = '' OR t.name LIKE '%' || :tournament || '%') GROUP BY m.id ORDER BY m.end_at DESC LIMIT 100",
+                    "params": ["game", "tournament"]
+                },
+
+                "team_roster": {
+                    "title": "Team Roster",
+                    "description": "Active players on a team. Enter a full or partial team name. Try: Team Liquid, Natus Vincere, Cloud9.",
+                    "sql": "SELECT te.name AS team, p.name AS player, p.first_name, p.last_name, p.role, p.nationality, p.active FROM players p JOIN teams te ON te.id = p.current_team_id WHERE te.name LIKE '%' || :team || '%' ORDER BY p.role, p.name",
+                    "params": ["team"]
+                },
+                "team_schedule": {
+                    "title": "Team Schedule & Results",
+                    "description": "Recent and upcoming matches for a team — all statuses in one view, newest first. Enter a full or partial team name. Try: Team Liquid, Natus Vincere, Cloud9.",
+                    "sql": "SELECT m.scheduled_at, m.status, v.name AS game, t.name AS tournament, t.tier, m.match_type, MAX(CASE WHEN mo_rn.rn = 1 THEN COALESCE(tm.name, p.name) END) AS team_1, MAX(CASE WHEN mo_rn.rn = 1 THEN mo_rn.score END) AS score_1, MAX(CASE WHEN mo_rn.rn = 2 THEN COALESCE(tm.name, p.name) END) AS team_2, MAX(CASE WHEN mo_rn.rn = 2 THEN mo_rn.score END) AS score_2 FROM matches m JOIN videogames v ON v.id = m.videogame_id JOIN tournaments t ON t.id = m.tournament_id JOIN match_opponents mof ON mof.match_id = m.id AND mof.opponent_type = 'team' JOIN teams ft ON ft.id = mof.opponent_id AND ft.name LIKE '%' || :team || '%' LEFT JOIN (SELECT match_id, opponent_id, opponent_type, score, ROW_NUMBER() OVER (PARTITION BY match_id ORDER BY id) AS rn FROM match_opponents) mo_rn ON mo_rn.match_id = m.id LEFT JOIN teams tm ON mo_rn.opponent_id = tm.id AND mo_rn.opponent_type = 'team' LEFT JOIN players p ON mo_rn.opponent_id = p.id AND mo_rn.opponent_type = 'player' GROUP BY m.id ORDER BY m.scheduled_at DESC LIMIT 100",
+                    "params": ["team"]
                 }
             },
             "tables": {
