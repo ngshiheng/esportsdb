@@ -26,13 +26,12 @@ setup:    ## setup scraper.
 run: scrape-fast    ## run scraper (alias for scrape-fast; use scrape-slow for first-time backfill).
 
 .PHONY: scrape-fast
-scrape-fast:    ## refresh live/upcoming data + last 48 h of matches + teams (mirrors scrape-fast.yml).
+scrape-fast:    ## refresh running/upcoming data + teams (mirrors scrape-fast.yml).
 	@$(UV) run --script scrape.py --db $(SQLITE_FILE) \
-		--resource series_upcoming --resource series_running \
-		--resource tournaments_upcoming --resource tournaments_running \
-		--resource matches_upcoming --resource matches_running \
-		--resource matches --since 48h \
-		--resource teams
+        --resource series_upcoming --resource series_running \
+        --resource tournaments_upcoming --resource tournaments_running \
+        --resource matches_upcoming --resource matches_running \
+        --resource teams
 
 .PHONY: scrape-slow
 scrape-slow:    ## refresh reference data — leagues, series, tournaments, teams, players (mirrors scrape-daily.yml).
