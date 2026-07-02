@@ -130,14 +130,13 @@ def test_fetch_all_no_since_yields_all_pages_and_stops_on_partial():
     assert mock_fetch.call_count == 2
 
 
-def test_match_opponent_rows_team_type_is_lowercase():
+def test_match_opponent_rows_preserves_api_type_casing():
     """
     FAILING before fix.
 
-    The PandaScore API returns "type": "Team" (PascalCase) at the slot level.
-    The SQL queries in metadata.json join on opponent_type = 'team' (lowercase),
-    so the type must be normalised to lowercase when stored or team_1/team_2
-    will always be NULL.
+    The scraper should preserve the raw PandaScore payload in the DB. PandaScore
+    returns "type": "Team" (PascalCase), so match_opponent_rows() must store
+    that value unchanged. Query normalization belongs in metadata.json.
     """
     record = {
         "id": 1,
@@ -148,7 +147,7 @@ def test_match_opponent_rows_team_type_is_lowercase():
         "results": [],
     }
     rows = scrape.match_opponent_rows(record)
-    assert rows[0]["opponent_type"] == "team"
+    assert rows[0]["opponent_type"] == "Team"
 
 
 def test_match_opponent_rows_score_from_results_array():
@@ -177,11 +176,6 @@ def test_match_opponent_rows_score_from_results_array():
     assert scores == {10: 2, 20: 0}
 
 
-# ---------------------------------------------------------------------------
-# Existing tests — updated to real API structure
-# ---------------------------------------------------------------------------
-
-
 def test_match_opponent_rows_basic():
     """
     Two opponents with a declared winner: the winning opponent gets is_winner=1,
@@ -207,14 +201,14 @@ def test_match_opponent_rows_basic():
         {
             "match_id": 42,
             "opponent_id": 10,
-            "opponent_type": "team",
+            "opponent_type": "Team",
             "score": 2,
             "is_winner": 1,
         },
         {
             "match_id": 42,
             "opponent_id": 20,
-            "opponent_type": "team",
+            "opponent_type": "Team",
             "score": 0,
             "is_winner": 0,
         },
@@ -651,7 +645,7 @@ def test_videogame_to_row_current_version_can_be_none():
 def test_match_opponent_rows_falls_back_to_slot_type_when_opponent_has_no_type():
     """
     When the nested opponent dict has no 'type' key, the row must fall back
-    to the slot-level 'type' field and normalise it to lowercase.
+    to the slot-level 'type' field without altering the API casing.
     """
     record = {
         "id": 5,
@@ -663,7 +657,7 @@ def test_match_opponent_rows_falls_back_to_slot_type_when_opponent_has_no_type()
     }
     rows = scrape.match_opponent_rows(record)
     assert len(rows) == 1
-    assert rows[0]["opponent_type"] == "player"
+    assert rows[0]["opponent_type"] == "Player"
 
 
 def test_parse_since_strips_leading_trailing_whitespace():

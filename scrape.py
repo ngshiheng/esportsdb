@@ -609,11 +609,7 @@ def match_opponent_rows(match_record: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "match_id": match_id,
                 "opponent_id": opponent_id,
-                # Normalise to lowercase: API returns "Team"/"Player" (PascalCase)
-                # but all SQL JOINs compare against 'team'/'player' (lowercase).
-                "opponent_type": (
-                    opponent.get("type") or slot.get("type", "unknown")
-                ).lower(),
+                "opponent_type": opponent.get("type") or slot.get("type", "Unknown"),
                 "score": results_lookup.get(opponent_id),
                 "is_winner": int(opponent_id == winner_id) if winner_id else None,
             }
