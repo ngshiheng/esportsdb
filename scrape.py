@@ -586,6 +586,15 @@ def match_to_row(record: dict[str, Any]) -> dict[str, Any]:
 def match_opponent_rows(match_record: dict[str, Any]) -> list[dict[str, Any]]:
     match_id = match_record["id"]
     winner_id = match_record.get("winner_id")
+
+    # Scores live in the top-level 'results' array, NOT in the opponent slots.
+    # API shape: [{"score": N, "team_id": T}, ...]
+    results_lookup: dict[int, int | None] = {
+        r["team_id"]: r.get("score")
+        for r in match_record.get("results", [])
+        if "team_id" in r
+    }
+
     rows: list[dict[str, Any]] = []
 
     for slot in match_record.get("opponents", []):
@@ -598,8 +607,12 @@ def match_opponent_rows(match_record: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "match_id": match_id,
                 "opponent_id": opponent_id,
-                "opponent_type": opponent.get("type") or slot.get("type", "Unknown"),
-                "score": slot.get("score"),
+                # Normalise to lowercase: API returns "Team"/"Player" (PascalCase)
+                # but all SQL JOINs compare against 'team'/'player' (lowercase).
+                "opponent_type": (
+                    opponent.get("type") or slot.get("type", "unknown")
+                ).lower(),
+                "score": results_lookup.get(opponent_id),
                 "is_winner": int(opponent_id == winner_id) if winner_id else None,
             }
         )

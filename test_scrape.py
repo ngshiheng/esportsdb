@@ -130,17 +130,74 @@ def test_fetch_all_no_since_yields_all_pages_and_stops_on_partial():
     assert mock_fetch.call_count == 2
 
 
-def test_match_opponent_rows_basic():
+def test_match_opponent_rows_team_type_is_lowercase():
     """
-    Two opponents with a declared winner: the winning opponent gets is_winner=1,
-    the loser gets is_winner=0. score and opponent_type are extracted correctly.
+    FAILING before fix.
+
+    The PandaScore API returns "type": "Team" (PascalCase) at the slot level.
+    The SQL queries in metadata.json join on opponent_type = 'team' (lowercase),
+    so the type must be normalised to lowercase when stored or team_1/team_2
+    will always be NULL.
+    """
+    record = {
+        "id": 1,
+        "winner_id": None,
+        "opponents": [
+            {"type": "Team", "opponent": {"id": 10}},
+        ],
+        "results": [],
+    }
+    rows = scrape.match_opponent_rows(record)
+    assert rows[0]["opponent_type"] == "team"
+
+
+def test_match_opponent_rows_score_from_results_array():
+    """
+    FAILING before fix.
+
+    The PandaScore API does NOT include a score field inside opponent slots.
+    Scores are in a separate top-level 'results' array:
+        [{'score': N, 'team_id': T}, ...]
+    The function must look up each opponent's score from that array.
     """
     record = {
         "id": 42,
         "winner_id": 10,
         "opponents": [
-            {"opponent": {"id": 10, "type": "Team"}, "score": 2},
-            {"opponent": {"id": 20, "type": "Team"}, "score": 0},
+            {"type": "Team", "opponent": {"id": 10}},
+            {"type": "Team", "opponent": {"id": 20}},
+        ],
+        "results": [
+            {"score": 2, "team_id": 10},
+            {"score": 0, "team_id": 20},
+        ],
+    }
+    rows = scrape.match_opponent_rows(record)
+    scores = {r["opponent_id"]: r["score"] for r in rows}
+    assert scores == {10: 2, 20: 0}
+
+
+# ---------------------------------------------------------------------------
+# Existing tests — updated to real API structure
+# ---------------------------------------------------------------------------
+
+
+def test_match_opponent_rows_basic():
+    """
+    Two opponents with a declared winner: the winning opponent gets is_winner=1,
+    the loser gets is_winner=0.  Uses real API shape: slot-level 'type',
+    scores from the top-level 'results' array, no score field in slots.
+    """
+    record = {
+        "id": 42,
+        "winner_id": 10,
+        "opponents": [
+            {"type": "Team", "opponent": {"id": 10}},
+            {"type": "Team", "opponent": {"id": 20}},
+        ],
+        "results": [
+            {"score": 2, "team_id": 10},
+            {"score": 0, "team_id": 20},
         ],
     }
 
@@ -150,14 +207,14 @@ def test_match_opponent_rows_basic():
         {
             "match_id": 42,
             "opponent_id": 10,
-            "opponent_type": "Team",
+            "opponent_type": "team",
             "score": 2,
             "is_winner": 1,
         },
         {
             "match_id": 42,
             "opponent_id": 20,
-            "opponent_type": "Team",
+            "opponent_type": "team",
             "score": 0,
             "is_winner": 0,
         },
@@ -173,10 +230,11 @@ def test_match_opponent_rows_slot_without_opponent_is_skipped():
         "id": 99,
         "winner_id": None,
         "opponents": [
-            {"opponent": {"id": 5, "type": "Team"}, "score": 1},
-            {"score": 0},  # no 'opponent' key
-            {"opponent": None, "score": 0},  # opponent is None
+            {"type": "Team", "opponent": {"id": 5}},
+            {"type": "Team"},  # no 'opponent' key
+            {"type": "Team", "opponent": None},  # opponent is None
         ],
+        "results": [],
     }
 
     rows = scrape.match_opponent_rows(record)
@@ -189,14 +247,16 @@ def test_match_opponent_rows_no_winner_sets_is_winner_none():
     """
     When winner_id is None (match not yet finished), is_winner must be None
     for every row — not 0 — because 0 implies a known loser.
+    Score is also None because upcoming matches have no results yet.
     """
     record = {
         "id": 7,
         "winner_id": None,
         "opponents": [
-            {"opponent": {"id": 1, "type": "Team"}, "score": None},
-            {"opponent": {"id": 2, "type": "Team"}, "score": None},
+            {"type": "Team", "opponent": {"id": 1}},
+            {"type": "Team", "opponent": {"id": 2}},
         ],
+        "results": [],
     }
 
     rows = scrape.match_opponent_rows(record)
@@ -429,7 +489,8 @@ def test_scrape_resource_calls_extra_rows_fn_and_upserts_junction_rows():
         {
             "id": 1,
             "name": "Match A",
-            "opponents": [{"opponent": {"id": 10, "type": "Team"}, "score": 2}],
+            "opponents": [{"type": "Team", "opponent": {"id": 10}}],
+            "results": [{"score": 2, "team_id": 10}],
             "winner_id": 10,
         }
     ]
@@ -502,25 +563,107 @@ def test_scrape_resource_saves_partial_progress_on_rate_limit_error():
 
 def test_match_opponent_rows_empty_opponents_list():
     """An empty opponents list must produce an empty result."""
-    record = {"id": 1, "winner_id": None, "opponents": []}
+    record = {"id": 1, "winner_id": None, "opponents": [], "results": []}
     assert scrape.match_opponent_rows(record) == []
+
+
+def test_match_opponent_rows_score_is_none_when_no_results():
+    """
+    Documents expected API behaviour: upcoming/running matches have no
+    'results' entry yet, so score must be None (not a bug).
+    """
+    record = {
+        "id": 9,
+        "winner_id": None,
+        "opponents": [{"type": "Team", "opponent": {"id": 5}}],
+        "results": [],
+    }
+    rows = scrape.match_opponent_rows(record)
+    assert rows[0]["score"] is None
+
+
+def test_match_opponent_rows_score_is_none_when_team_absent_from_results():
+    """
+    If a team_id appears in opponents but not in results (partial data),
+    the score must safely default to None.
+    """
+    record = {
+        "id": 10,
+        "winner_id": None,
+        "opponents": [{"type": "Team", "opponent": {"id": 99}}],
+        "results": [{"score": 3, "team_id": 77}],  # different team
+    }
+    rows = scrape.match_opponent_rows(record)
+    assert rows[0]["score"] is None
+
+
+def test_tournament_to_row_maps_full_name():
+    """
+    full_name is present in the PandaScore tournament response but is None
+    for most tournaments (sparse data — not a code bug).
+    The field must always be mapped regardless of its value.
+    """
+    record = {
+        "id": 1,
+        "name": "Group A",
+        "full_name": None,
+        "slug": "group-a",
+        "begin_at": None,
+        "end_at": None,
+        "serie": None,
+        "league": None,
+        "videogame": None,
+        "tier": "a",
+        "has_bracket": False,
+        "live_supported": False,
+        "detailed_stats": False,
+        "prizepool": None,
+        "winner_id": None,
+        "winner_type": None,
+    }
+    row = scrape.tournament_to_row(record)
+    assert "full_name" in row
+    assert row["full_name"] is None
+
+    # When the API does supply a full_name it must be stored.
+    record["full_name"] = "IEM Katowice 2026 Group A"
+    row = scrape.tournament_to_row(record)
+    assert row["full_name"] == "IEM Katowice 2026 Group A"
+
+
+def test_videogame_to_row_current_version_can_be_none():
+    """
+    current_version is None for most games (e.g. Counter-Strike, Dota 2).
+    Only LoL and Valorant currently return a non-None version.
+    Both cases must be mapped correctly — this is not a bug.
+    """
+    row_none = scrape.videogame_to_row(
+        {"id": 3, "name": "Counter-Strike", "slug": "cs-go", "current_version": None}
+    )
+    assert row_none["current_version"] is None
+
+    row_versioned = scrape.videogame_to_row(
+        {"id": 1, "name": "LoL", "slug": "lol", "current_version": "16.13.1"}
+    )
+    assert row_versioned["current_version"] == "16.13.1"
 
 
 def test_match_opponent_rows_falls_back_to_slot_type_when_opponent_has_no_type():
     """
     When the nested opponent dict has no 'type' key, the row must fall back
-    to the slot-level 'type' field.
+    to the slot-level 'type' field and normalise it to lowercase.
     """
     record = {
         "id": 5,
         "winner_id": None,
         "opponents": [
-            {"type": "Player", "opponent": {"id": 99}, "score": None},
+            {"type": "Player", "opponent": {"id": 99}},
         ],
+        "results": [],
     }
     rows = scrape.match_opponent_rows(record)
     assert len(rows) == 1
-    assert rows[0]["opponent_type"] == "Player"
+    assert rows[0]["opponent_type"] == "player"
 
 
 def test_parse_since_strips_leading_trailing_whitespace():
