@@ -450,6 +450,8 @@ SCHEMA_DDL: tuple[str, ...] = (
         UNIQUE (match_id, opponent_id, opponent_type)
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status)",
+    "CREATE INDEX IF NOT EXISTS idx_matches_status_end_at ON matches(status, end_at)",
 )
 
 
