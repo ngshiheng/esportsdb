@@ -1,8 +1,8 @@
 # esportsdb
 
-[![Scrape (upcoming)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-upcoming.yml)
-[![Scrape (daily)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-daily.yml)
-[![Scrape (historical backfill)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/backfill.yml)
+[![Scrape (fast)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-fast.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-fast.yml)
+[![Scrape (slow)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-slow.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-slow.yml)
+[![Scrape (history)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-history.yml/badge.svg)](https://github.com/ngshiheng/esportsdb/actions/workflows/scrape-history.yml)
 
 A self-contained PandaScore scraper that builds and maintains a SQLite database of esports data (videogames, leagues, series, tournaments, matches, teams, players). The DB is persisted as a GitHub Actions artifact and kept fresh via a three-workflow CI pipeline.
 
@@ -13,12 +13,14 @@ flowchart TD
     PS[("PandaScore API<br>api.pandascore.co")]
 
     subgraph CI ["GitHub Actions (serialised via concurrency group)"]
-        S["scrape-daily.yml<br>Daily 02:00 UTC<br>all non-match tables"]
-        F["scrape-upcoming.yml<br>Every 2 hours<br>upcoming / live / recent matches"]
-        B["backfill.yml<br>workflow_dispatch only<br>full historical matches sweep"]
+        S["scrape-slow.yml<br>Daily 02:00 UTC<br>all non-match tables"]
+        F["scrape-fast.yml<br>Every 2 hours<br>upcoming / live matches + teams"]
+        B["scrape-history.yml<br>workflow_dispatch only<br>full historical matches sweep"]
     end
 
     ART[("GitHub Artifact<br>esports.db")]
+    RW["Railway<br>Datasette"]
+    USER(["User"])
 
     PS -->|"paginated REST<br>100 records/page<br>4s inter-page delay"| S
     PS --> F
@@ -31,25 +33,23 @@ flowchart TD
     S -->|"upload on success"| ART
     F -->|"upload on success"| ART
     B -->|"upload on success"| ART
+
+    S -->|"redeploy"| RW
+    F -->|"redeploy"| RW
+
+    USER -->|"SQL / Datasette UI"| RW
 ```
 
 All three workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex — only one job holds the artifact lock at a time; others queue and wait.
 
 ## CI Workflows
 
-| Workflow              | Schedule                 | Resources                                                            | Purpose                                                              |
-| --------------------- | ------------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `scrape-daily.yml`    | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match tables                          |
-| `scrape-upcoming.yml` | Every 2 hours            | `*_upcoming`, `*_running`, `matches --since 48h`                     | Keep upcoming/live data fresh; catch recently finalised match scores |
-| `backfill.yml`        | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)       |
-| `test.yml`            | Every push / PR          | —                                                                    | Run unit tests                                                       |
-
-### scrape-upcoming detail
-
-Two sequential scrape steps per run:
-
-1. **Upcoming & live** — `series_upcoming`, `series_running`, `tournaments_upcoming`, `tournaments_running`, `matches_upcoming`, `matches_running` (no `--since` filter — always fetches the full upcoming window)
-2. **Recent past matches** — `matches --since 48h` (catches matches that just finished and need score/status written back)
+| Workflow             | Schedule                 | Resources                                                            | Purpose                                                                               |
+| -------------------- | ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `scrape-slow.yml`    | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match reference tables; Docker publish; Railway deploy |
+| `scrape-fast.yml`    | Every 2 hours            | `*_upcoming`, `*_running`, `teams`                                   | Refresh upcoming/live matches and team data; Railway deploy                           |
+| `scrape-history.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)                        |
+| `test.yml`           | Every push / PR          | —                                                                    | Run unit tests                                                                        |
 
 ## Database Schema
 
@@ -158,7 +158,11 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 
 ## Secrets required
 
-| Secret               | Used by                                                       |
-| -------------------- | ------------------------------------------------------------- |
-| `PANDASCORE_API_KEY` | All scrape jobs                                               |
-| `GH_PAT`             | Artifact download across workflow runs (needs `actions:read`) |
+| Secret                   | Used by                                               |
+| ------------------------ | ----------------------------------------------------- |
+| `PANDASCORE_API_KEY`     | All scrape jobs                                       |
+| `DOCKERHUB_TOKEN`        | `scrape-slow.yml` — Docker image publish              |
+| `RAILWAY_TOKEN`          | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
+| `RAILWAY_PROJECT_ID`     | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
+| `RAILWAY_ENVIRONMENT_ID` | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
+| `RAILWAY_SERVICE_ID`     | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
