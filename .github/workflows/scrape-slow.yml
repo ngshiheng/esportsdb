@@ -57,13 +57,21 @@ jobs:
               continue-on-error: true
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
+                  SCRAPE_OUTCOME: /tmp/scrape-outcome.json
               run: make scrape-slow
+
+            - name: Validate database integrity and scrape relationships
+              id: validate_integrity
+              if: always()
+              continue-on-error: true
+              run: uv run --script scrape.py --validate-db --db "$DB_PATH" --outcome /tmp/scrape-outcome.json
 
             # Gate: prevent an empty/corrupt DB from overwriting a good artifact.
             # Runs even when scrape was rate-limited so partial progress is preserved.
             - name: Validate DB
               id: validate_db
               if: always()
+              continue-on-error: true
               run: |
                   set -euo pipefail
                   if [ ! -f "$DB_PATH" ]; then
@@ -79,13 +87,17 @@ jobs:
                   fi
 
             - name: Upload updated DB artifact
-              if: ${{ always() && steps.validate_db.outcome == 'success' }}
+              if: ${{ always() && steps.validate_db.outcome == 'success' && steps.validate_integrity.outcome == 'success' }}
               uses: actions/upload-artifact@v7
               with:
                   name: ${{ env.ARTIFACT_NAME }}
                   path: ${{ env.DB_PATH }}
                   if-no-files-found: error
                   retention-days: 1
+
+            - name: Fail when candidate validation fails
+              if: ${{ always() && (steps.validate_db.outcome != 'success' || steps.validate_integrity.outcome != 'success') }}
+              run: exit 1
 
             - name: Install datasette
               run: pipx install datasette
@@ -104,6 +116,7 @@ jobs:
 
     deploy:
         needs: scrape
+        if: ${{ needs.scrape.result == 'success' }}
         runs-on: ubuntu-latest
         timeout-minutes: 15
         permissions:

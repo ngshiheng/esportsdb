@@ -1,4 +1,5 @@
 NAME := esportsdb
+SCRAPE_OUTCOME ?= /tmp/esportsdb-scrape-outcome.json
 
 SHELL=/bin/bash
 DATASETTE := $(shell command -v datasette 2> /dev/null)
@@ -31,17 +32,17 @@ scrape-fast:    ## refresh running/upcoming data + teams (mirrors scrape-fast.ym
         --resource series_upcoming --resource series_running \
         --resource tournaments_upcoming --resource tournaments_running \
         --resource matches_upcoming --resource matches_running \
-        --resource teams
+        --resource teams --outcome $(SCRAPE_OUTCOME)
 
 .PHONY: scrape-slow
-scrape-slow:    ## refresh reference data — leagues, series, tournaments, teams, players (mirrors scrape-daily.yml).
+scrape-slow:    ## refresh reference data - leagues, series, tournaments, teams, players (mirrors scrape-daily.yml).
 	@$(UV) run --script scrape.py --db $(SQLITE_FILE) \
 		--resource videogames --resource leagues \
 		--resource series --resource tournaments \
-		--resource teams --resource players
+		--resource teams --resource players --outcome $(SCRAPE_OUTCOME)
 
 .PHONY: scrape-history
-scrape-history:    ## one-time full historical match backfill (slow, hours — run manually once).
+scrape-history:    ## one-time full historical match backfill (slow, hours - run manually once).
 	@$(UV) run --script scrape.py --db $(SQLITE_FILE) --resource matches --page-delay 3
 
 .PHONY: test

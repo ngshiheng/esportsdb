@@ -9,7 +9,7 @@
 # ]
 # ///
 """
-PandaScore periodic scraper — populates a local SQLite database.
+PandaScore periodic scraper - populates a local SQLite database.
 
 Set PANDASCORE_API_KEY in your environment before running.
 
@@ -28,11 +28,12 @@ Usage:
     ./scrape.py --count
 
 Rate budget: default --page-delay of 5.0s keeps throughput at ~720 req/hr (limit: 1,000/hr).
-HTTP responses are cached locally via hishel (TTL 2h) — crash-safe to re-run immediately.
+HTTP responses are cached locally via hishel (TTL 2h) - crash-safe to re-run immediately.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -109,7 +110,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-app = typer.Typer()
+app = typer.Typer(invoke_without_command=True)
 
 
 class RateLimitError(Exception):
@@ -144,7 +145,7 @@ def _before_sleep(retry_state: RetryCallState) -> None:
 
     if isinstance(exc, RateLimitError):
         log.warning(
-            "Rate limited on /%s page %d (attempt %d) — backing off %.1fs.",
+            "Rate limited on /%s page %d (attempt %d) - backing off %.1fs.",
             endpoint,
             page_number,
             tries,
@@ -153,7 +154,7 @@ def _before_sleep(retry_state: RetryCallState) -> None:
 
     else:
         log.warning(
-            "Request error on /%s page %d (attempt %d) — backing off %.1fs: %s",
+            "Request error on /%s page %d (attempt %d) - backing off %.1fs: %s",
             endpoint,
             page_number,
             tries,
@@ -168,6 +169,20 @@ class PageResult:
 
     records: list[dict[str, Any]]
     from_cache: bool
+
+
+@dataclass(frozen=True)
+class ScrapeResult:
+    """Outcome for one resource scrape."""
+
+    attempted: int = 0
+    persisted: int = 0
+    fk_rejected: int = 0
+    api_incomplete: bool = False
+    unresolved_relationships: int = 0
+    missing_opponents: int = 0
+    unsupported_opponents: int = 0
+    records_to_retry: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,7 +231,7 @@ class PandaScoreClient:
         # Cache-Control: no-store) so responses are cached and served
         # regardless of server expiration directives.
         # _SuccessOnlyFilter: prevents error responses (5xx, 429) from being
-        # stored in the cache — retries must always hit the real API.
+        # stored in the cache - retries must always hit the real API.
         storage = SyncSqliteStorage(default_ttl=None)
         policy = FilterPolicy(response_filters=[_SuccessOnlyFilter()])
         self._http = SyncCacheClient(
@@ -327,7 +342,7 @@ class PandaScoreClient:
                 break
             page_number += 1
 
-            # Cache hits are instant — no need to throttle against the API rate limit.
+            # Cache hits are instant - no need to throttle against the API rate limit.
             if not result.from_cache:
                 time.sleep(self.page_delay)
 
@@ -457,11 +472,7 @@ SCHEMA_DDL: tuple[str, ...] = (
 
 @dataclass
 class Database:
-    """Manages the SQLite connection, schema, and upsert operations.
-
-    Attributes:
-        path: Filesystem path to the .db file.
-    """
+    """Manages the SQLite connection, schema, and upsert operations."""
 
     path: Path
     _connection: sqlite3.Connection = field(init=False, repr=False)
@@ -477,23 +488,154 @@ class Database:
         self._connection.commit()
 
     def upsert(self, table: str, row: dict[str, Any]) -> None:
-        columns = ", ".join(row.keys())
-        placeholders = ", ".join("?" * len(row))
-        self._connection.execute(
-            f"INSERT OR REPLACE INTO {table} ({columns}) VALUES ({placeholders})",
-            list(row.values()),
+        columns = tuple(row)
+        column_names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        values = tuple(row.values())
+        if table == "match_opponents":
+            conflict_columns = ("match_id", "opponent_id", "opponent_type")
+        else:
+            conflict_columns = ("id",)
+        conflict_target = ", ".join(conflict_columns)
+        updates = tuple(column for column in columns if column not in conflict_columns)
+        if updates:
+            update_clause = ", ".join(
+                f"{column} = excluded.{column}" for column in updates
+            )
+            sql = (
+                f"INSERT INTO {table} ({column_names}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({conflict_target}) DO UPDATE SET {update_clause}"
+            )
+        else:
+            sql = (
+                f"INSERT INTO {table} ({column_names}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({conflict_target}) DO NOTHING"
+            )
+        self._connection.execute(sql, values)
+
+    def opponent_exists(self, opponent_id: int, opponent_type: str) -> bool:
+        table = {"team": "teams", "player": "players"}.get(opponent_type.casefold())
+        if table is None:
+            return False
+        return (
+            self._connection.execute(
+                f"SELECT 1 FROM {table} WHERE id = ?", (opponent_id,)
+            ).fetchone()
+            is not None
         )
 
     def commit(self) -> None:
         self._connection.commit()
 
     def close(self) -> None:
-        """Close the underlying SQLite connection.
-
-        Called automatically by ``contextlib.closing()`` when used as:
-        ``with closing(Database(...)) as db``.
-        """
         self._connection.close()
+
+
+@dataclass(frozen=True)
+class DatabaseValidationResult:
+    issues: tuple[str, ...]
+    integrity: str
+    foreign_key_violations: int
+
+    @property
+    def valid(self) -> bool:
+        return not self.issues
+
+
+def validate_database(
+    path: Path, outcome_path: Path | None = None
+) -> DatabaseValidationResult:
+    """Validate a candidate database without modifying it."""
+    if not path.is_file():
+        return DatabaseValidationResult(
+            issues=(f"Database does not exist: {path}",),
+            integrity="missing",
+            foreign_key_violations=0,
+        )
+
+    issues: list[str] = []
+    integrity = "unknown"
+    foreign_key_rows: list[tuple[Any, ...]] = []
+    try:
+        with closing(
+            sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+        ) as connection:
+            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity != "ok":
+                issues.append(f"SQLite integrity_check failed: {integrity}")
+
+            foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+            for table, rowid, parent, foreign_key in foreign_key_rows:
+                issues.append(
+                    f"Foreign-key violation: table={table}, rowid={rowid}, "
+                    f"parent={parent}, fk={foreign_key}"
+                )
+
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if {"match_opponents", "teams", "players"}.issubset(tables):
+                unsupported = connection.execute(
+                    "SELECT id, match_id, opponent_id, opponent_type "
+                    "FROM match_opponents "
+                    "WHERE lower(opponent_type) NOT IN ('team', 'player')"
+                ).fetchall()
+                for row in unsupported:
+                    issues.append(
+                        f"Unsupported opponent type {row[3]!r} "
+                        f"(match_opponents.id={row[0]}, match_id={row[1]}, "
+                        f"opponent_id={row[2]})"
+                    )
+
+                unresolved = connection.execute(
+                    "SELECT o.id, o.match_id, o.opponent_id, o.opponent_type "
+                    "FROM match_opponents o "
+                    "WHERE (lower(o.opponent_type) = 'team' AND NOT EXISTS "
+                    "(SELECT 1 FROM teams t WHERE t.id = o.opponent_id)) "
+                    "OR (lower(o.opponent_type) = 'player' AND NOT EXISTS "
+                    "(SELECT 1 FROM players p WHERE p.id = o.opponent_id))"
+                ).fetchall()
+                for row in unresolved:
+                    issues.append(
+                        f"Unresolved {row[3]} opponent id={row[2]} "
+                        f"(match_opponents.id={row[0]}, match_id={row[1]})"
+                    )
+
+                missing_opponents = connection.execute(
+                    "SELECT COUNT(*) FROM matches m "
+                    "WHERE m.status IN ('not_started', 'running') "
+                    "AND NOT EXISTS "
+                    "(SELECT 1 FROM match_opponents o WHERE o.match_id=m.id)"
+                ).fetchone()[0]
+                if missing_opponents:
+                    log.warning(
+                        "%d current/upcoming matches have no opponent rows; "
+                        "reported as source-data incompleteness, not an FK failure",
+                        missing_opponents,
+                    )
+    except sqlite3.Error as exc:
+        issues.append(f"Cannot validate database {path}: {exc}")
+
+    if outcome_path is not None:
+        try:
+            outcome = json.loads(outcome_path.read_text())
+            unresolved_count = int(outcome.get("unresolved_relationships", -1))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            issues.append(f"Cannot read valid scrape outcome {outcome_path}: {exc}")
+        else:
+            if unresolved_count != 0:
+                issues.append(
+                    f"Scrape reported {unresolved_count} unresolved relationship(s)"
+                )
+
+    return DatabaseValidationResult(
+        issues=tuple(issues),
+        integrity=integrity,
+        foreign_key_violations=len(foreign_key_rows),
+    )
 
 
 def _nested_id(record: dict[str, Any], key: str) -> int | None:
@@ -589,32 +731,37 @@ def match_opponent_rows(match_record: dict[str, Any]) -> list[dict[str, Any]]:
     match_id = match_record["id"]
     winner_id = match_record.get("winner_id")
 
-    # Scores live in the top-level 'results' array, NOT in the opponent slots.
-    # API shape: [{"score": N, "team_id": T}, ...]
     results_lookup: dict[int, int | None] = {
-        r["team_id"]: r.get("score")
-        for r in match_record.get("results", [])
-        if "team_id" in r
+        result["team_id"]: result.get("score")
+        for result in match_record.get("results", [])
+        if "team_id" in result
     }
 
     rows: list[dict[str, Any]] = []
-
     for slot in match_record.get("opponents", []):
         opponent = slot.get("opponent") or {}
         opponent_id = opponent.get("id")
         if opponent_id is None:
             continue
 
+        opponent_type = opponent.get("type") or slot.get("type") or "Unknown"
+        normalized_type = opponent_type.casefold()
+        if normalized_type not in {"team", "player"}:
+            log.error(
+                "Unsupported opponent type %r for match id=%s opponent id=%s",
+                opponent_type,
+                match_id,
+                opponent_id,
+            )
         rows.append(
             {
                 "match_id": match_id,
                 "opponent_id": opponent_id,
-                "opponent_type": opponent.get("type") or slot.get("type", "Unknown"),
+                "opponent_type": opponent_type,
                 "score": results_lookup.get(opponent_id),
                 "is_winner": int(opponent_id == winner_id) if winner_id else None,
             }
         )
-
     return rows
 
 
@@ -655,66 +802,137 @@ def scrape_resource(
     table: str,
     extra_rows_fn: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     skip_fk_errors: bool = False,
-) -> int:
-    """Page through one endpoint, upsert rows, and commit after each page.
+    retry_records: tuple[dict[str, Any], ...] | None = None,
+) -> ScrapeResult:
+    """Fetch records or retry a deferred batch, committing each API page."""
+    attempted = persisted = fk_rejected = 0
+    missing_opponents = unsupported_opponents = 0
+    records_to_retry: list[dict[str, Any]] = []
+    api_incomplete = False
 
-    Args:
-        client: The API client.
-        db: The database instance.
-        endpoint: PandaScore endpoint path (e.g. 'matches').
-        to_row: Function mapping one API record to a DB row dict.
-        table: Target table name.
-        extra_rows_fn: Optional function producing additional junction rows
-                       from the same record (e.g. match_opponent_rows).
-    """
-    total = 0
-    try:
-        for page in client.fetch_all(endpoint):
-            for record in page:
-                row = to_row(record)
+    def persist_record(record: dict[str, Any]) -> None:
+        nonlocal attempted, persisted, fk_rejected
+        nonlocal missing_opponents, unsupported_opponents
+        attempted += 1
+        row = to_row(record)
+        try:
+            db.upsert(table, row)
+        except sqlite3.IntegrityError as exc:
+            fk_rejected += 1
+            log.error(
+                "FK violation upserting into '%s' (record id=%s): %s; row=%s",
+                table,
+                record.get("id"),
+                exc,
+                row,
+            )
+            if not skip_fk_errors:
+                raise
+            records_to_retry.append(record)
+            return
 
-                try:
-                    db.upsert(table, row)
+        persisted += 1
+        if not extra_rows_fn:
+            return
 
-                except sqlite3.IntegrityError as exc:
-                    log.error(
-                        "FK violation upserting into '%s' (record id=%s): %s\n  row: %s",
-                        table,
-                        record.get("id"),
-                        exc,
-                        row,
-                    )
-                    if skip_fk_errors:
-                        continue
+        opponents = record.get("opponents", [])
+        if not opponents:
+            missing_opponents += 1
+            log.warning(
+                "Match id=%s has no opponent entries in the API response",
+                record.get("id"),
+            )
+
+        rejected = False
+        for extra_row in extra_rows_fn(record):
+            opponent_type = extra_row["opponent_type"]
+            normalized_type = opponent_type.casefold()
+            if normalized_type not in {"team", "player"}:
+                unsupported_opponents += 1
+                rejected = True
+                log.error(
+                    "Unsupported opponent type %r (match_id=%s, opponent_id=%s)",
+                    opponent_type,
+                    extra_row["match_id"],
+                    extra_row["opponent_id"],
+                )
+                continue
+            if not db.opponent_exists(extra_row["opponent_id"], opponent_type):
+                fk_rejected += 1
+                rejected = True
+                log.error(
+                    "Unresolved %s opponent id=%s for match_id=%s",
+                    opponent_type,
+                    extra_row["opponent_id"],
+                    extra_row["match_id"],
+                )
+                continue
+            try:
+                db.upsert("match_opponents", extra_row)
+            except sqlite3.IntegrityError as exc:
+                fk_rejected += 1
+                rejected = True
+                log.error(
+                    "FK violation upserting match_opponents "
+                    "(match_id=%s, opponent_id=%s, opponent_type=%s): %s; row=%s",
+                    extra_row["match_id"],
+                    extra_row["opponent_id"],
+                    opponent_type,
+                    exc,
+                    extra_row,
+                )
+                if not skip_fk_errors:
                     raise
+        if rejected:
+            records_to_retry.append(record)
 
-                if extra_rows_fn:
-                    for extra_row in extra_rows_fn(record):
-                        try:
-                            db.upsert("match_opponents", extra_row)
-
-                        except sqlite3.IntegrityError as exc:
-                            log.error(
-                                "FK violation upserting into 'match_opponents' "
-                                "(match_id=%s): %s\n  row: %s",
-                                extra_row.get("match_id"),
-                                exc,
-                                extra_row,
-                            )
-                            if skip_fk_errors:
-                                continue
-                            raise
+    try:
+        if retry_records is None:
+            for page in client.fetch_all(endpoint):
+                for record in page:
+                    persist_record(record)
+                db.commit()
+        else:
+            for record in retry_records:
+                persist_record(record)
             db.commit()
-            total += len(page)
-
-    except (RateLimitError, ServerError) as exc:
+    except (
+        RateLimitError,
+        ServerError,
+        httpx.RequestError,
+        httpx.HTTPStatusError,
+    ) as exc:
+        api_incomplete = True
         log.warning(
-            "Request failed on /%s after %d records — saving partial progress: %s",
+            "Request failed on /%s after %d persisted records; saving partial progress: %s",
             endpoint,
-            total,
+            persisted,
             exc,
         )
-    return total
+
+    result = ScrapeResult(
+        attempted=attempted,
+        persisted=persisted,
+        fk_rejected=fk_rejected,
+        api_incomplete=api_incomplete,
+        unresolved_relationships=len(records_to_retry),
+        missing_opponents=missing_opponents,
+        unsupported_opponents=unsupported_opponents,
+        records_to_retry=tuple(records_to_retry),
+    )
+    log.info(
+        "/%s outcome: attempted=%d persisted=%d fk_rejected=%d unresolved=%d "
+        "missing_opponents=%d unsupported_opponents=%d api_incomplete=%s",
+        endpoint,
+        result.attempted,
+        result.persisted,
+        result.fk_rejected,
+        result.unresolved_relationships,
+        result.missing_opponents,
+        result.unsupported_opponents,
+        result.api_incomplete,
+    )
+    return result
 
 
 @dataclass(frozen=True)
@@ -784,47 +1002,114 @@ RESOURCE_CONFIG: dict[str, ResourceConfig] = {
 }
 
 
-def run_scrape(config: ScraperConfig) -> None:
-    with (
-        closing(
-            PandaScoreClient(
-                api_key=config.api_key,
-                page_size=config.page_size,
-                since=config.since,
-                page_delay=config.page_delay,
-            )
-        ) as client,
-        closing(Database(path=config.db_path)) as db,
-    ):
+def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
+    """Scrape configured resources, retry deferred rows, and write an outcome."""
+    unresolved_relationships = 0
+    api_incomplete = False
+    missing_opponents = 0
+    unsupported_opponents = 0
+    client = PandaScoreClient(
+        api_key=config.api_key,
+        page_size=config.page_size,
+        since=config.since,
+        page_delay=config.page_delay,
+    )
+    db = Database(path=config.db_path)
+    try:
         db.ensure_schema()
-
-        log.info(
-            "Starting scrape: %s%s",
-            list(config.resources),
-            f" (since {config.since})" if config.since else "",
-        )
         started_at = time.monotonic()
+        deferred: list[tuple[str, ResourceConfig, ScrapeResult]] = []
+
+        def scrape_one(resource: str, cfg: ResourceConfig) -> ScrapeResult:
+            nonlocal api_incomplete, missing_opponents, unsupported_opponents
+            result = scrape_resource(
+                client,
+                db,
+                endpoint=cfg.endpoint or resource,
+                table=cfg.table,
+                to_row=cfg.to_row,
+                extra_rows_fn=cfg.extra_rows_fn,
+                skip_fk_errors=True,
+            )
+            api_incomplete |= result.api_incomplete
+            missing_opponents += result.missing_opponents
+            unsupported_opponents += result.unsupported_opponents
+            return result
 
         for resource in config.resources:
             cfg = RESOURCE_CONFIG.get(resource)
             if cfg is None:
-                log.warning("Unknown resource '%s' — skipping.", resource)
+                log.warning("Unknown resource '%s' - skipping.", resource)
                 continue
+            result = scrape_one(resource, cfg)
+            if result.records_to_retry:
+                deferred.append((resource, cfg, result))
 
-            endpoint = cfg.endpoint or resource
-            log.info("  Scraping /%s ...", endpoint)
-            count = scrape_resource(
+        for resource, cfg, first_result in deferred:
+            refreshed: set[str] = set()
+
+            def refresh_dependencies(parent: str) -> None:
+                nonlocal unresolved_relationships
+                if parent in refreshed:
+                    return
+                refreshed.add(parent)
+                for ancestor in RESOURCE_DEPENDENCIES.get(parent, ()):
+                    refresh_dependencies(ancestor)
+                parent_cfg = RESOURCE_CONFIG.get(parent)
+                if parent_cfg is not None:
+                    parent_result = scrape_one(parent, parent_cfg)
+                    unresolved_relationships += parent_result.unresolved_relationships
+
+            for parent in RESOURCE_DEPENDENCIES.get(resource, ()):
+                refresh_dependencies(parent)
+
+            if cfg.extra_rows_fn is match_opponent_rows:
+                opponent_parents = {
+                    row["opponent_type"].casefold()
+                    for record in first_result.records_to_retry
+                    for row in match_opponent_rows(record)
+                    if row["opponent_type"].casefold() in {"team", "player"}
+                }
+                for parent in opponent_parents:
+                    parent_cfg = RESOURCE_CONFIG[parent + "s"]
+                    parent_result = scrape_one(parent + "s", parent_cfg)
+                    unresolved_relationships += parent_result.unresolved_relationships
+
+            retry_result = scrape_resource(
                 client,
                 db,
-                endpoint=endpoint,
+                endpoint=cfg.endpoint or resource,
                 table=cfg.table,
                 to_row=cfg.to_row,
                 extra_rows_fn=cfg.extra_rows_fn,
-                skip_fk_errors=cfg.skip_fk_errors,
+                skip_fk_errors=True,
+                retry_records=first_result.records_to_retry,
             )
-            log.info("    → %d records upserted.", count)
+            api_incomplete |= retry_result.api_incomplete
+            missing_opponents += retry_result.missing_opponents
+            unsupported_opponents += retry_result.unsupported_opponents
+            unresolved_relationships += retry_result.unresolved_relationships
 
-    log.info("Scrape complete in %.1fs.", time.monotonic() - started_at)
+        if outcome_path is not None:
+            outcome_path.parent.mkdir(parents=True, exist_ok=True)
+            outcome_path.write_text(
+                json.dumps(
+                    {
+                        "unresolved_relationships": unresolved_relationships,
+                        "api_incomplete": api_incomplete,
+                        "missing_opponents": missing_opponents,
+                        "unsupported_opponents": unsupported_opponents,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        log.info("Scrape complete in %.1fs.", time.monotonic() - started_at)
+    finally:
+        client.close()
+        db.close()
+
+    return unresolved_relationships
 
 
 def _parse_since(value: str) -> str:
@@ -907,34 +1192,47 @@ def main(
     since: Annotated[
         str | None,
         typer.Option(
-            help=(
-                "Only fetch matches with begin_at >= WHEN. "
-                "Accepts ISO-8601 (2025-01-01T00:00:00Z) or shorthand: 48h, 7d. "
-                "Ignored for non-match resources."
-            )
+            help="Only fetch matches with begin_at >= WHEN. Accepts ISO-8601 or shorthand 48h/7d."
         ),
     ] = None,
     page_delay: Annotated[
-        float,
-        typer.Option(
-            help="Seconds between paginated requests. Default keeps throughput ~900 req/hr."
-        ),
+        float, typer.Option(help="Seconds between paginated requests.")
     ] = INTER_PAGE_DELAY_SECONDS,
+    outcome: Annotated[
+        Path | None,
+        typer.Option("--outcome", help="Write/read the scrape outcome JSON path."),
+    ] = None,
+    validate_db: Annotated[
+        bool,
+        typer.Option(
+            "--validate-db", help="Validate the database and exit without scraping."
+        ),
+    ] = False,
     count: Annotated[
         bool,
         typer.Option(
-            "--count/--no-count",
-            help="Print the total record count for each requested resource (1 API request per resource) then exit. Does not scrape.",
+            "--count/--no-count", help="Print remote totals without scraping."
         ),
     ] = False,
 ) -> None:
-    """Entrypoint."""
+    """Scrape PandaScore resources or validate a database candidate."""
+    if validate_db:
+        result = validate_database(db, outcome)
+        if result.valid:
+            log.info(
+                "Database validation passed (integrity=%s, no FK violations).",
+                result.integrity,
+            )
+            return
+        for issue in result.issues:
+            log.error("Database validation failed: %s", issue)
+        raise typer.Exit(code=1)
+
     api_key = os.environ.get("PANDASCORE_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("Error: PANDASCORE_API_KEY environment variable is not set.")
 
     resources = resource or list(ALL_RESOURCES)
-
     if count:
         with closing(PandaScoreClient(api_key=api_key)) as client:
             for res in resources:
@@ -942,25 +1240,26 @@ def main(
                 if cfg is None:
                     log.info("%s: unknown resource", res)
                     continue
-
                 endpoint = cfg.endpoint or res
                 total = client.fetch_total(endpoint)
                 pages = ((total - 1) // DEFAULT_PAGE_SIZE + 1) if total else "?"
                 delay_min = (
                     (pages if isinstance(pages, int) else 0) * INTER_PAGE_DELAY_SECONDS
                 ) / 60
-
                 log.info(
-                    "%s: %d records  ~%d pages  ~%.1f min delay",
+                    "%s: %d records ~%d pages ~%.1f min delay",
                     endpoint,
                     total,
                     pages,
                     delay_min,
                 )
-
         return
 
-    run_scrape(_build_config(api_key, db, resources, page_size, since, page_delay))
+    unresolved = run_scrape(
+        _build_config(api_key, db, resources, page_size, since, page_delay), outcome
+    )
+    if unresolved:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ flowchart TD
     USER -->|"SQL / Datasette UI"| RW
 ```
 
-All three workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex — only one job holds the artifact lock at a time; others queue and wait.
+All three workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex - only one job holds the artifact lock at a time; others queue and wait.
 
 ## CI Workflows
 
@@ -49,7 +49,7 @@ All three workflows share the **`esportsdb-artifact` concurrency group** (`cance
 | `scrape-slow.yml`    | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match reference tables; Docker publish; Railway deploy |
 | `scrape-fast.yml`    | Every 2 hours            | `*_upcoming`, `*_running`, `teams`                                   | Refresh upcoming/live matches and team data; Railway deploy                           |
 | `scrape-history.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)                        |
-| `test.yml`           | Every push / PR          | —                                                                    | Run unit tests                                                                        |
+| `test.yml`           | Every push / PR          | -                                                                    | Run unit tests                                                                        |
 
 ## Database Schema
 
@@ -145,14 +145,18 @@ videogames → leagues → series → tournaments → matches → match_opponent
                        teams → players
 ```
 
-Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their parent resource. They use `skip_fk_errors=True` — orphaned rows are logged and skipped rather than crashing the run.
+Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their parent resource. FK-rejected child records are reported, parent resources are refreshed before one retry, and any still-unresolved relationship blocks artifact publication. Valid rows remain committed in the candidate database. An upstream API failure can still produce a publishable partial refresh when all saved relationships and SQLite integrity checks pass; the previous artifact remains available when validation fails. Missing opponent entries are reported as source-data incompleteness, not as an FK violation.
+
+## Integrity validation and recovery
+
+The scheduled fast and slow workflows validate the candidate database with SQLite `integrity_check` and `foreign_key_check` before uploading. The scraper records attempted, persisted, and FK-rejected row outcomes in its logs and writes a machine-readable outcome file for the gate. If unresolved relationships or integrity violations remain, the candidate is not uploaded and the next run restores the last-known-good artifact. Inspect the validation errors in the workflow log, correct the missing parent data or source issue, and rerun the workflow. API endpoint failures alone do not block publishing a partial refresh when the saved database passes all relationship checks. Matches with no opponent rows are reported separately as source-data incompleteness.
 
 ## Rate Limiting & Caching
 
 | Setting          | Value                      | Notes                                                                                                                                                                                   |
 | ---------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Inter-page delay | 5.0 s (3.0 s for backfill) | Keeps throughput ~720 req/hr vs 1,000/hr limit                                                                                                                                          |
-| HTTP cache TTL   | None (no expiry)           | `hishel` SQLite-backed cache — entries persist until manually cleared; only HTTP 200 responses are stored (`_SuccessOnlyFilter`), so transient 5xx errors are never replayed from cache |
+| HTTP cache TTL   | None (no expiry)           | `hishel` SQLite-backed cache - entries persist until manually cleared; only HTTP 200 responses are stored (`_SuccessOnlyFilter`), so transient 5xx errors are never replayed from cache |
 | Max retries      | 5                          | Exponential backoff on `httpx.RequestError`, HTTP 429, and HTTP 5xx                                                                                                                     |
 | Backoff factor   | 2.0 s initial              | `tenacity` `wait_exponential`, min 2 s, max 60 s                                                                                                                                        |
 
@@ -161,8 +165,8 @@ Sub-resources (e.g. `matches_upcoming`) share the same FK dependencies as their 
 | Secret                   | Used by                                               |
 | ------------------------ | ----------------------------------------------------- |
 | `PANDASCORE_API_KEY`     | All scrape jobs                                       |
-| `DOCKERHUB_TOKEN`        | `scrape-slow.yml` — Docker image publish              |
-| `RAILWAY_TOKEN`          | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
-| `RAILWAY_PROJECT_ID`     | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
-| `RAILWAY_ENVIRONMENT_ID` | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
-| `RAILWAY_SERVICE_ID`     | `scrape-fast.yml`, `scrape-slow.yml` — Railway deploy |
+| `DOCKERHUB_TOKEN`        | `scrape-slow.yml` - Docker image publish              |
+| `RAILWAY_TOKEN`          | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
+| `RAILWAY_PROJECT_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
+| `RAILWAY_ENVIRONMENT_ID` | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
+| `RAILWAY_SERVICE_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |

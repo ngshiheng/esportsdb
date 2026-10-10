@@ -9,7 +9,12 @@
 #   "pytest>=8.0",
 # ]
 # ///
-from unittest.mock import MagicMock, patch
+import json
+import sqlite3
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 import scrape
 
@@ -55,7 +60,7 @@ def test_fetch_all_since_stops_early_when_page_crosses_cutoff():
             {"id": 2, "begin_at": "2025-01-11T00:00:00Z"},
         ]
     ]
-    # Page 2 must never be requested — the loop should have broken after page 1
+    # Page 2 must never be requested - the loop should have broken after page 1
     mock_fetch.assert_called_once_with("matches", 1)
 
 
@@ -85,15 +90,15 @@ def test_fetch_all_since_yields_nothing_when_all_records_before_cutoff():
 def test_fetch_all_since_silently_drops_records_missing_begin_at():
     """
     Records with begin_at=None (or the key absent entirely) are silently
-    excluded from the yielded page. This confirms — and documents — the
+    excluded from the yielded page. This confirms - and documents - the
     silent-drop behaviour so a future refactor doesn't change it unknowingly.
     """
     client = make_client(since="2025-01-10T00:00:00Z")
 
     page1 = [
-        {"id": 1, "begin_at": "2025-01-12T00:00:00Z"},  # valid — included
-        {"id": 2, "begin_at": None},  # None — silently dropped
-        {"id": 3},  # key absent — silently dropped
+        {"id": 1, "begin_at": "2025-01-12T00:00:00Z"},  # valid - included
+        {"id": 2, "begin_at": None},  # None - silently dropped
+        {"id": 3},  # key absent - silently dropped
     ]
 
     with patch.object(
@@ -176,6 +181,50 @@ def test_match_opponent_rows_score_from_results_array():
     assert scores == {10: 2, 20: 0}
 
 
+def test_match_opponent_type_case_variants_are_preserved():
+    for raw_type in ("Team", "team", "Player", "player"):
+        record = {
+            "id": 100,
+            "opponents": [{"type": raw_type, "opponent": {"id": 55}}],
+            "results": [],
+        }
+        rows = scrape.match_opponent_rows(record)
+        assert rows[0]["opponent_type"] == raw_type
+
+
+def test_match_opponent_unknown_type_is_preserved_for_validation():
+    record = {
+        "id": 101,
+        "opponents": [{"type": "Coach", "opponent": {"id": 56}}],
+        "results": [],
+    }
+    rows = scrape.match_opponent_rows(record)
+    assert rows[0]["opponent_type"] == "Coach"
+
+
+def test_match_opponent_type_case_variants_are_preserved():
+    for raw_type in ("Team", "team", "Player", "player"):
+        rows = scrape.match_opponent_rows(
+            {
+                "id": 100,
+                "opponents": [{"type": raw_type, "opponent": {"id": 55}}],
+                "results": [],
+            }
+        )
+        assert rows[0]["opponent_type"] == raw_type
+
+
+def test_match_opponent_unknown_type_is_preserved_for_validation():
+    rows = scrape.match_opponent_rows(
+        {
+            "id": 101,
+            "opponents": [{"type": "Coach", "opponent": {"id": 56}}],
+            "results": [],
+        }
+    )
+    assert rows[0]["opponent_type"] == "Coach"
+
+
 def test_match_opponent_rows_basic():
     """
     Two opponents with a declared winner: the winning opponent gets is_winner=1,
@@ -218,7 +267,7 @@ def test_match_opponent_rows_basic():
 def test_match_opponent_rows_slot_without_opponent_is_skipped():
     """
     A slot where the 'opponent' key is missing (or None) must be skipped
-    entirely — no row should be produced for it.
+    entirely - no row should be produced for it.
     """
     record = {
         "id": 99,
@@ -240,7 +289,7 @@ def test_match_opponent_rows_slot_without_opponent_is_skipped():
 def test_match_opponent_rows_no_winner_sets_is_winner_none():
     """
     When winner_id is None (match not yet finished), is_winner must be None
-    for every row — not 0 — because 0 implies a known loser.
+    for every row - not 0 - because 0 implies a known loser.
     Score is also None because upcoming matches have no results yet.
     """
     record = {
@@ -287,23 +336,13 @@ def test_parse_since_passthrough_iso8601():
     assert scrape._parse_since(iso) == iso
 
 
-def test_scrape_resource_skip_fk_errors_continues_and_still_counts_full_page():
-    """
-    HIGH RISK: silent skip + wrong total count.
-
-    When skip_fk_errors=True and one record raises IntegrityError, processing
-    must continue for remaining records in the page. The returned total also
-    counts the full page (documenting the known mis-count behaviour so any
-    future fix is deliberate).
-    """
+def test_scrape_resource_reports_skipped_rows_as_unpersisted():
+    """FK-rejected rows are attempted but do not count as persisted."""
     import sqlite3
 
     client = make_client()
     mock_db = MagicMock()
-
     records = [{"id": 1}, {"id": 2}, {"id": 3}]
-
-    # upsert raises on the first record, succeeds for the others
     mock_db.upsert.side_effect = [
         sqlite3.IntegrityError("FK constraint failed"),
         None,
@@ -311,21 +350,105 @@ def test_scrape_resource_skip_fk_errors_continues_and_still_counts_full_page():
     ]
 
     with patch.object(client, "fetch_all", return_value=iter([records])):
-        total = scrape.scrape_resource(
+        result = scrape.scrape_resource(
             client=client,
             db=mock_db,
             endpoint="teams",
-            to_row=lambda r: r,
+            to_row=lambda record: record,
             table="teams",
             skip_fk_errors=True,
         )
 
-    # All three records were attempted despite the first failure
-    assert mock_db.upsert.call_count == 3
-    # Commit was called once (after the page)
+    assert result.attempted == 3
+    assert result.persisted == 2
+    assert result.fk_rejected == 1
+    assert result.unresolved_relationships == 1
+    assert [record["id"] for record in result.records_to_retry] == [1]
     mock_db.commit.assert_called_once()
-    # Total reflects full page length (documents the known mis-count)
-    assert total == 3
+
+
+def test_scrape_resource_rejects_unresolved_opponent_reference():
+    client = make_client()
+    mock_db = MagicMock()
+    mock_db.opponent_exists.return_value = False
+    records = [
+        {
+            "id": 7,
+            "opponents": [{"type": "Team", "opponent": {"id": 999}}],
+        }
+    ]
+
+    with patch.object(client, "fetch_all", return_value=iter([records])):
+        result = scrape.scrape_resource(
+            client=client,
+            db=mock_db,
+            endpoint="matches/upcoming",
+            to_row=lambda record: {"id": record["id"]},
+            table="matches",
+            extra_rows_fn=scrape.match_opponent_rows,
+            skip_fk_errors=True,
+        )
+
+    assert result.fk_rejected == 1
+    assert result.unresolved_relationships == 1
+    assert mock_db.upsert.call_args_list == [call("matches", {"id": 7})]
+
+
+def test_database_match_opponent_retry_does_not_replace_existing_row(tmp_path):
+    path = tmp_path / "upsert.db"
+    db = scrape.Database(path)
+    db.ensure_schema()
+    db.upsert("videogames", {"id": 1, "name": "game", "slug": "game"})
+    db.upsert(
+        "leagues", {"id": 2, "name": "league", "slug": "league", "videogame_id": 1}
+    )
+    db.upsert("series", {"id": 3, "name": "series", "league_id": 2, "videogame_id": 1})
+    db.upsert(
+        "tournaments",
+        {"id": 4, "name": "event", "serie_id": 3, "league_id": 2, "videogame_id": 1},
+    )
+    db.upsert(
+        "matches",
+        {"id": 5, "tournament_id": 4, "serie_id": 3, "league_id": 2, "videogame_id": 1},
+    )
+    db.upsert("teams", {"id": 6, "name": "team", "slug": "team"})
+    row = {
+        "match_id": 5,
+        "opponent_id": 6,
+        "opponent_type": "Team",
+        "score": None,
+        "is_winner": None,
+    }
+    db.upsert("match_opponents", row)
+    db.upsert("match_opponents", {**row, "score": 2})
+    result = db._connection.execute(
+        "SELECT score FROM match_opponents WHERE match_id=5 AND opponent_id=6"
+    ).fetchone()
+    db.close()
+
+    assert result == (2,)
+
+
+def test_scrape_resource_reports_missing_opponents_without_fk_rejection():
+    client = make_client()
+    mock_db = MagicMock()
+    records = [{"id": 7, "opponents": []}]
+
+    with patch.object(client, "fetch_all", return_value=iter([records])):
+        result = scrape.scrape_resource(
+            client=client,
+            db=mock_db,
+            endpoint="matches/upcoming",
+            to_row=lambda record: {"id": record["id"]},
+            table="matches",
+            extra_rows_fn=scrape.match_opponent_rows,
+            skip_fk_errors=True,
+        )
+
+    assert result.persisted == 1
+    assert result.fk_rejected == 0
+    assert result.missing_opponents == 1
+    assert result.unresolved_relationships == 0
 
 
 def test_scrape_resource_raises_on_fk_error_when_skip_is_false():
@@ -399,6 +522,129 @@ def test_fetch_all_stops_immediately_on_empty_first_page():
     mock_fetch.assert_called_once_with("videogames", 1)
 
 
+def test_run_scrape_writes_partial_api_outcome_without_fk_failures(tmp_path):
+    config = scrape.ScraperConfig(
+        api_key="test",
+        db_path=tmp_path / "candidate.db",
+        resources=("videogames",),
+        page_size=100,
+    )
+    client = make_client()
+    with (
+        patch("scrape.PandaScoreClient", return_value=client),
+        patch("scrape.Database") as db_factory,
+        patch("scrape.closing", side_effect=lambda value: value),
+        patch.object(
+            scrape,
+            "scrape_resource",
+            return_value=scrape.ScrapeResult(api_incomplete=True),
+        ),
+    ):
+        db_factory.return_value.__enter__.return_value = MagicMock()
+        outcome_path = tmp_path / "outcome.json"
+        unresolved = scrape.run_scrape(config, outcome_path)
+
+    assert unresolved == 0
+    outcome = json.loads(outcome_path.read_text())
+    assert outcome["api_incomplete"] is True
+    assert outcome["unresolved_relationships"] == 0
+
+
+def test_validate_database_rejects_foreign_key_violations(tmp_path):
+    path = tmp_path / "invalid.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY);"
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));"
+        "INSERT INTO child(id, parent_id) VALUES (1, 99);"
+    )
+    connection.close()
+
+    result = scrape.validate_database(path)
+
+    assert not result.valid
+    assert result.foreign_key_violations == 1
+
+
+def test_validate_database_allows_valid_partial_api_refresh(tmp_path):
+    path = tmp_path / "valid.db"
+    outcome = tmp_path / "outcome.json"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY);"
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));"
+        "INSERT INTO parent(id) VALUES (1);"
+        "INSERT INTO child(id, parent_id) VALUES (2, 1);"
+    )
+    connection.close()
+    outcome.write_text('{"unresolved_relationships": 0, "api_incomplete": true}')
+
+    result = scrape.validate_database(path, outcome)
+
+    assert result.valid
+    assert result.integrity == "ok"
+    assert result.foreign_key_violations == 0
+
+
+def test_validate_database_rejects_unresolved_outcome(tmp_path):
+    path = tmp_path / "valid.db"
+    outcome = tmp_path / "outcome.json"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE item(id INTEGER PRIMARY KEY)")
+    connection.close()
+    outcome.write_text('{"unresolved_relationships": 2}')
+
+    result = scrape.validate_database(path, outcome)
+
+    assert not result.valid
+    assert any("unresolved relationship" in issue for issue in result.issues)
+
+
+def test_validate_database_accepts_case_variants_and_rejects_unknown_type(tmp_path):
+    path = tmp_path / "opponents.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE matches(id INTEGER PRIMARY KEY, status TEXT);"
+        "CREATE TABLE teams(id INTEGER PRIMARY KEY);"
+        "CREATE TABLE players(id INTEGER PRIMARY KEY);"
+        "CREATE TABLE match_opponents(id INTEGER PRIMARY KEY, match_id INTEGER, "
+        "opponent_id INTEGER, opponent_type TEXT);"
+        "INSERT INTO matches VALUES (1, 'running');"
+        "INSERT INTO teams VALUES (10);"
+        "INSERT INTO players VALUES (20);"
+        "INSERT INTO match_opponents VALUES (1, 1, 10, 'team');"
+        "INSERT INTO match_opponents VALUES (2, 1, 20, 'Player');"
+    )
+    connection.close()
+
+    result = scrape.validate_database(path)
+    assert result.valid
+
+    connection = sqlite3.connect(path)
+    connection.execute("INSERT INTO match_opponents VALUES (3, 1, 30, 'Coach')")
+    connection.commit()
+    connection.close()
+
+    result = scrape.validate_database(path)
+    assert not result.valid
+    assert any("Unsupported opponent type 'Coach'" in issue for issue in result.issues)
+
+
+def test_validate_database_rejects_unresolved_scrape_outcome(tmp_path):
+    db_path = tmp_path / "candidate.db"
+    outcome_path = tmp_path / "outcome.json"
+    connection = __import__("sqlite3").connect(db_path)
+    connection.execute("CREATE TABLE item(id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    outcome_path.write_text('{"unresolved_relationships": 2}')
+
+    result = scrape.validate_database(db_path, outcome_path)
+
+    assert result.valid is False
+    assert any("unresolved relationship" in issue for issue in result.issues)
+
+
 def test_fetch_all_live_request_sleeps_between_full_pages():
     """time.sleep must be called once between two live full pages."""
     client = make_client(page_size=2, page_delay=1.5)
@@ -446,7 +692,7 @@ def test_fetch_all_since_continues_when_entire_page_is_above_cutoff():
     When all records on a full page are above the cutoff, fetch_all must
     continue to the next page rather than stopping early.
 
-    This exercises the `len(filtered) == len(records)` path — the break only
+    This exercises the `len(filtered) == len(records)` path - the break only
     fires when some records fall below the cutoff.
     """
     client = make_client(since="2025-01-01T00:00:00Z", page_size=2)
@@ -503,6 +749,55 @@ def test_scrape_resource_calls_extra_rows_fn_and_upserts_junction_rows():
     assert tables_upserted == ["matches", "match_opponents"]
 
 
+def test_run_scrape_retries_fk_rejected_record_after_refreshing_parents():
+    player = {
+        "id": 4,
+        "name": "player",
+        "current_team": {"id": 9},
+        "current_videogame": {"id": 1},
+    }
+    config = scrape.ScraperConfig(
+        api_key="test",
+        db_path=Path("unused.db"),
+        resources=("players",),
+        page_size=100,
+    )
+    client = make_client()
+    db = MagicMock()
+    first_result = scrape.ScrapeResult(
+        attempted=1,
+        fk_rejected=1,
+        unresolved_relationships=1,
+        records_to_retry=(player,),
+    )
+
+    with (
+        patch("scrape.PandaScoreClient", return_value=client),
+        patch("scrape.Database", return_value=db),
+        patch.object(
+            scrape,
+            "scrape_resource",
+            side_effect=[
+                first_result,
+                scrape.ScrapeResult(attempted=1, persisted=1),
+                scrape.ScrapeResult(attempted=1, persisted=1),
+                scrape.ScrapeResult(attempted=1, persisted=1),
+            ],
+        ) as mock_scrape,
+    ):
+        unresolved = scrape.run_scrape(config)
+
+    assert unresolved == 0
+    assert mock_scrape.call_count == 4
+    assert [call.kwargs.get("endpoint") for call in mock_scrape.call_args_list] == [
+        "players",
+        "videogames",
+        "teams",
+        "players",
+    ]
+    assert mock_scrape.call_args_list[-1].kwargs["retry_records"] == (player,)
+
+
 def test_scrape_resource_saves_partial_progress_on_server_error():
     """
     When fetch_all raises ServerError mid-iteration, scrape_resource must
@@ -517,7 +812,7 @@ def test_scrape_resource_saves_partial_progress_on_server_error():
         raise scrape.ServerError("500 on /matches page 2")
 
     with patch.object(client, "fetch_all", side_effect=_raises_after_first_page):
-        total = scrape.scrape_resource(
+        result = scrape.scrape_resource(
             client=client,
             db=mock_db,
             endpoint="matches",
@@ -525,7 +820,8 @@ def test_scrape_resource_saves_partial_progress_on_server_error():
             table="matches",
         )
 
-    assert total == 2
+    assert result.persisted == 2
+    assert result.api_incomplete is True
     mock_db.commit.assert_called_once()
 
 
@@ -543,7 +839,7 @@ def test_scrape_resource_saves_partial_progress_on_rate_limit_error():
         raise scrape.RateLimitError("429 on /matches page 2")
 
     with patch.object(client, "fetch_all", side_effect=_raises_after_first_page):
-        total = scrape.scrape_resource(
+        result = scrape.scrape_resource(
             client=client,
             db=mock_db,
             endpoint="matches",
@@ -551,7 +847,8 @@ def test_scrape_resource_saves_partial_progress_on_rate_limit_error():
             table="matches",
         )
 
-    assert total == 1
+    assert result.persisted == 1
+    assert result.api_incomplete is True
     mock_db.commit.assert_called_once()
 
 
@@ -594,7 +891,7 @@ def test_match_opponent_rows_score_is_none_when_team_absent_from_results():
 def test_tournament_to_row_maps_full_name():
     """
     full_name is present in the PandaScore tournament response but is None
-    for most tournaments (sparse data — not a code bug).
+    for most tournaments (sparse data - not a code bug).
     The field must always be mapped regardless of its value.
     """
     record = {
@@ -629,7 +926,7 @@ def test_videogame_to_row_current_version_can_be_none():
     """
     current_version is None for most games (e.g. Counter-Strike, Dota 2).
     Only LoL and Valorant currently return a non-None version.
-    Both cases must be mapped correctly — this is not a bug.
+    Both cases must be mapped correctly - this is not a bug.
     """
     row_none = scrape.videogame_to_row(
         {"id": 3, "name": "Counter-Strike", "slug": "cs-go", "current_version": None}
