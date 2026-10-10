@@ -51,9 +51,12 @@ test:   ## run unit tests.
 
 .PHONY: datasette
 datasette:  ## run datasette with optimizations.
-	@[ -f $(SQLITE_FILE) ] && echo "File $(SQLITE_FILE) exists." || { echo "File $(SQLITE_FILE) does not exist." >&2; exit 1; }
-	@if [ -z $(DATASETTE) ]; then echo "Datasette could not be found. See https://docs.datasette.io/en/stable/installation.html"; exit 2; fi
-	@$(DATASETTE) -i $(SQLITE_FILE) --setting allow_download off --setting allow_csv_stream off --setting max_csv_mb 1 --setting default_cache_ttl 86400 --setting sql_time_limit_ms 2000 --metadata data/metadata.json --root
+	@PORT=8001; \
+	while lsof -iTCP:$$PORT -sTCP:LISTEN >/dev/null 2>&1; do \
+	  PORT=$$((PORT+1)); \
+	done; \
+	echo "Starting datasette on port $$PORT"; \
+	$(DATASETTE) --root $(SQLITE_FILE) --metadata data/metadata.json --port $$PORT --reload
 
 ##@ Docker
 .PHONY: docker-build
