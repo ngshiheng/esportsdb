@@ -36,8 +36,11 @@ def _metadata_fixture_connection():
         [(1, "Test League", "test-league", 1), (2, "Other League", "other-league", 2)],
     )
     connection.executemany(
-        "INSERT INTO series(id, name, league_id, videogame_id) VALUES (?, ?, ?, ?)",
-        [(1, "Test Series", 1, 1), (2, "Other Series", 2, 2)],
+        "INSERT INTO series(id, name, full_name, league_id, videogame_id) VALUES (?, ?, ?, ?, ?)",
+        [
+            (1, "Test Series", "Test Series Full Name", 1, 1),
+            (2, "Other Series", None, 2, 2),
+        ],
     )
     connection.executemany(
         "INSERT INTO tournaments(id, name, begin_at, end_at, serie_id, league_id, "
@@ -45,7 +48,14 @@ def _metadata_fixture_connection():
         [
             (1, "Test Cup", "2020-01-01", "2020-01-02", 1, 1, 1, "s", 1, "Team"),
             (2, "Other Cup", "2020-01-01", "2020-01-02", 2, 2, 2, "a", 2, "Team"),
+            (3, "No Series Completed", "2020-02-01", "2020-02-02", None, 1, 1, "s", None, None),
+            (4, "No Series Ongoing", None, None, None, 1, 1, "b", None, None),
+            (5, "No Series Upcoming", "2099-01-01", "2099-01-02", None, 1, 1, "c", None, None),
         ],
+    )
+    connection.execute(
+        "UPDATE tournaments SET begin_at = datetime('now', '-1 day'), "
+        "end_at = datetime('now', '+1 day') WHERE id = 4"
     )
     connection.executemany(
         "INSERT INTO teams(id, name, slug, acronym, current_videogame_id) VALUES (?, ?, ?, ?, ?)",
@@ -70,6 +80,7 @@ def _metadata_fixture_connection():
             (2, "Test Upcoming", 1, 1, 1, 1, "not_started", "2099-01-01", None, None),
             (3, "Test Finished", 1, 1, 1, 1, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
             (4, "Other Finished", 2, 2, 2, 2, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
+            (5, "No Series Finished", 3, None, 1, 1, "finished", "2020-02-02", "2020-02-02", "2020-02-02"),
         ],
     )
     connection.executemany(
@@ -1076,6 +1087,12 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
         ).fetchall() == []
 
         schedule_query = queries["team_schedule"]["sql"]
+        schedule_columns = [
+            column[0] for column in connection.execute(
+                schedule_query, {"game": "", "team": ""}
+            ).description
+        ]
+        match_id_index = schedule_columns.index("match_id")
         schedule_all = connection.execute(
             schedule_query, {"game": "", "team": ""}
         ).fetchall()
@@ -1088,11 +1105,11 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
         team_schedule = connection.execute(
             schedule_query, {"game": "", "team": "Test Team"}
         ).fetchall()
-        assert {row[0] for row in team_schedule} == {1, 2, 3}
+        assert {row[match_id_index] for row in team_schedule} == {1, 2, 3}
         combined_schedule = connection.execute(
             schedule_query, {"game": "Test Game", "team": "Test Team"}
         ).fetchall()
-        assert {row[0] for row in combined_schedule} == {1, 2, 3}
+        assert {row[match_id_index] for row in combined_schedule} == {1, 2, 3}
         assert connection.execute(
             schedule_query, {"game": "Missing Game", "team": ""}
         ).fetchall() == []
@@ -1109,13 +1126,13 @@ def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
         all_completed = connection.execute(
             completed_query, {"game": "", "tier": "", "tournament": ""}
         ).fetchall()
-        assert len(all_completed) == 2
+        assert len(all_completed) == 3
         assert len(connection.execute(
             completed_query, {"game": "Test Game", "tier": "", "tournament": ""}
-        ).fetchall()) == 1
+        ).fetchall()) == 2
         assert len(connection.execute(
             completed_query, {"game": "", "tier": "s", "tournament": ""}
-        ).fetchall()) == 1
+        ).fetchall()) == 2
         assert len(connection.execute(
             completed_query, {"game": "", "tier": "", "tournament": "Other"}
         ).fetchall()) == 1
@@ -1126,6 +1143,101 @@ def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
         assert len(connection.execute(
             queries["upcoming_matches"]["sql"], upcoming_params
         ).fetchall()) == 1
+    finally:
+        connection.close()
+
+
+def test_tournament_query_context_order_and_lifecycle_descriptions():
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    queries = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]
+    connection = _metadata_fixture_connection()
+    try:
+        expected_columns = ["game", "league", "series", "tournament"]
+        for query_name in (
+            "major_events",
+            "ongoing_tournaments",
+            "upcoming_tournaments",
+            "completed_tournaments",
+        ):
+            query = queries[query_name]
+            cursor = connection.execute(
+                query["sql"], {name: "" for name in query.get("params", [])}
+            )
+            assert [column[0] for column in cursor.description[:4]] == expected_columns
+
+        major_rows = connection.execute(
+            queries["major_events"]["sql"], {"game": ""}
+        ).fetchall()
+        assert any(row[2] == "Test Series Full Name" and row[3] == "Test Cup" for row in major_rows)
+        assert any(row[2] is None and row[3] == "No Series Completed" for row in major_rows)
+
+        ongoing = queries["ongoing_tournaments"]
+        assert ongoing["title"] == "Ongoing Tournaments"
+        ongoing_rows = connection.execute(
+            ongoing["sql"], {"game": "", "tier": ""}
+        ).fetchall()
+        assert any(row[3] == "No Series Ongoing" and row[2] is None for row in ongoing_rows)
+        assert "dates" in ongoing["description"].lower()
+        assert "separate from whether any match is live" in ongoing["description"]
+        assert "datetime('now')" in ongoing["sql"]
+
+        upcoming_rows = connection.execute(
+            queries["upcoming_tournaments"]["sql"], {"game": "", "tier": ""}
+        ).fetchall()
+        assert any(row[3] == "No Series Upcoming" and row[2] is None for row in upcoming_rows)
+        completed_rows = connection.execute(
+            queries["completed_tournaments"]["sql"], {"game": "", "tier": ""}
+        ).fetchall()
+        assert any(row[3] == "No Series Completed" and row[2] is None for row in completed_rows)
+
+        live = queries["live_matches"]
+        assert live["title"] == "Live Matches"
+        assert "running" in live["description"].lower()
+        assert "m.status = 'running'" in live["sql"]
+    finally:
+        connection.close()
+
+
+def test_match_query_context_order_full_names_and_missing_series():
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    queries = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]
+    connection = _metadata_fixture_connection()
+    try:
+        expected_columns = ["game", "league", "series", "tournament"]
+        query_names = (
+            "live_matches",
+            "upcoming_matches",
+            "completed_matches",
+            "team_schedule",
+        )
+        for query_name in query_names:
+            query = queries[query_name]
+            params = {name: "" for name in query.get("params", [])}
+            cursor = connection.execute(query["sql"], params)
+            columns = [column[0] for column in cursor.description]
+            assert columns[:4] == expected_columns
+            if query_name == "completed_matches":
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                missing_series = next(row for row in rows if row["match_name"] == "No Series Finished")
+                assert missing_series["series"] is None
+                assert missing_series["tournament"] == "No Series Completed"
+                missing_full_name = next(row for row in rows if row["match_name"] == "Other Finished")
+                assert missing_full_name["series"] is None
+            elif query_name == "live_matches":
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                assert rows[0]["series"] == "Test Series Full Name"
+            elif query_name == "upcoming_matches":
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                assert any(
+                    row["match_name"] == "Test Upcoming"
+                    and row["series"] == "Test Series Full Name"
+                    for row in rows
+                )
+
+        live = queries["live_matches"]
+        assert "status is marked running" in live["description"].lower()
+        assert "different from a tournament being ongoing" in live["description"].lower()
+        assert "m.status = 'running'" in live["sql"]
     finally:
         connection.close()
 
