@@ -386,7 +386,6 @@ SCHEMA_DDL: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS tournaments (
         id              INTEGER PRIMARY KEY,
         name            TEXT,
-        full_name       TEXT,
         slug            TEXT,
         begin_at        TEXT,
         end_at          TEXT,
@@ -422,7 +421,6 @@ SCHEMA_DDL: tuple[str, ...] = (
         rescheduled             INTEGER,
         original_scheduled_at   TEXT,
         forfeit                 INTEGER,
-        complete                INTEGER,
         detailed_stats          INTEGER,
         live_embed_url          TEXT
     )
@@ -485,7 +483,24 @@ class Database:
     def ensure_schema(self) -> None:
         for statement in SCHEMA_DDL:
             self._connection.execute(statement)
+        self._migrate_obsolete_columns()
         self._connection.commit()
+
+    def _migrate_obsolete_columns(self) -> None:
+        """Remove legacy columns that have no corresponding upstream values."""
+        obsolete_columns = {
+            "matches": "complete",
+            "tournaments": "full_name",
+        }
+        for table, column in obsolete_columns.items():
+            existing_columns = {
+                row[1]
+                for row in self._connection.execute(f"PRAGMA table_info({table})")
+            }
+            if column in existing_columns:
+                self._connection.execute(
+                    f"ALTER TABLE {table} DROP COLUMN {column}"
+                )
 
     def upsert(self, table: str, row: dict[str, Any]) -> None:
         columns = tuple(row)
@@ -643,6 +658,21 @@ def _nested_id(record: dict[str, Any], key: str) -> int | None:
     return nested.get("id") if isinstance(nested, dict) else None
 
 
+def _main_official_stream_embed_url(record: dict[str, Any]) -> str | None:
+    streams = record.get("streams_list")
+    if not isinstance(streams, list):
+        return None
+    for stream in streams:
+        if (
+            isinstance(stream, dict)
+            and stream.get("main") is True
+            and stream.get("official") is True
+        ):
+            embed_url = stream.get("embed_url")
+            return embed_url if isinstance(embed_url, str) else None
+    return None
+
+
 def videogame_to_row(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": record["id"],
@@ -684,7 +714,6 @@ def tournament_to_row(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": record["id"],
         "name": record.get("name"),
-        "full_name": record.get("full_name"),
         "slug": record.get("slug"),
         "begin_at": record.get("begin_at"),
         "end_at": record.get("end_at"),
@@ -721,9 +750,8 @@ def match_to_row(record: dict[str, Any]) -> dict[str, Any]:
         "rescheduled": record.get("rescheduled"),
         "original_scheduled_at": record.get("original_scheduled_at"),
         "forfeit": record.get("forfeit"),
-        "complete": record.get("complete"),
         "detailed_stats": record.get("detailed_stats"),
-        "live_embed_url": record.get("live_embed_url"),
+        "live_embed_url": _main_official_stream_embed_url(record),
     }
 
 

@@ -502,6 +502,94 @@ def test_database_match_opponent_retry_does_not_replace_existing_row(tmp_path):
     assert result == (2,)
 
 
+def test_ensure_schema_migrates_legacy_columns_and_is_repeatable(tmp_path):
+    db = scrape.Database(tmp_path / "legacy.db")
+    db.ensure_schema()
+    db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
+    db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
+    db.commit()
+
+    db.ensure_schema()
+    db.ensure_schema()
+
+    columns = {
+        table: {
+            row[1] for row in db._connection.execute(f"PRAGMA table_info({table})")
+        }
+        for table in ("matches", "tournaments")
+    }
+    db.close()
+
+    assert "complete" not in columns["matches"]
+    assert "full_name" not in columns["tournaments"]
+
+
+def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path):
+    db = scrape.Database(tmp_path / "populated-legacy.db")
+    db.ensure_schema()
+    db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
+    db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
+    db.upsert("videogames", {"id": 1, "name": "game", "slug": "game"})
+    db.upsert(
+        "leagues", {"id": 2, "name": "league", "slug": "league", "videogame_id": 1}
+    )
+    db.upsert("series", {"id": 3, "name": "series", "league_id": 2, "videogame_id": 1})
+    db.upsert(
+        "tournaments",
+        {
+            "id": 4,
+            "name": "event",
+            "full_name": "obsolete value",
+            "serie_id": 3,
+            "league_id": 2,
+            "videogame_id": 1,
+        },
+    )
+    db.upsert(
+        "matches",
+        {
+            "id": 5,
+            "tournament_id": 4,
+            "serie_id": 3,
+            "league_id": 2,
+            "videogame_id": 1,
+            "complete": 1,
+        },
+    )
+    db.upsert("teams", {"id": 6, "name": "team", "slug": "team"})
+    db.upsert(
+        "match_opponents",
+        {
+            "match_id": 5,
+            "opponent_id": 6,
+            "opponent_type": "Team",
+            "score": 2,
+            "is_winner": 1,
+        },
+    )
+    db.commit()
+
+    db.ensure_schema()
+
+    counts = {
+        table: db._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("videogames", "leagues", "series", "tournaments", "matches", "teams", "match_opponents")
+    }
+    foreign_key_violations = db._connection.execute("PRAGMA foreign_key_check").fetchall()
+    db.close()
+
+    assert counts == {
+        "videogames": 1,
+        "leagues": 1,
+        "series": 1,
+        "tournaments": 1,
+        "matches": 1,
+        "teams": 1,
+        "match_opponents": 1,
+    }
+    assert foreign_key_violations == []
+
+
 def test_scrape_resource_reports_missing_opponents_without_fk_rejection():
     client = make_client()
     mock_db = MagicMock()
@@ -961,12 +1049,7 @@ def test_match_opponent_rows_score_is_none_when_team_absent_from_results():
     assert rows[0]["score"] is None
 
 
-def test_tournament_to_row_maps_full_name():
-    """
-    full_name is present in the PandaScore tournament response but is None
-    for most tournaments (sparse data - not a code bug).
-    The field must always be mapped regardless of its value.
-    """
+def test_tournament_to_row_omits_unsupported_full_name():
     record = {
         "id": 1,
         "name": "Group A",
@@ -986,13 +1069,33 @@ def test_tournament_to_row_maps_full_name():
         "winner_type": None,
     }
     row = scrape.tournament_to_row(record)
-    assert "full_name" in row
-    assert row["full_name"] is None
-
-    # When the API does supply a full_name it must be stored.
     record["full_name"] = "IEM Katowice 2026 Group A"
     row = scrape.tournament_to_row(record)
-    assert row["full_name"] == "IEM Katowice 2026 Group A"
+    assert "full_name" not in row
+
+
+@pytest.mark.parametrize(
+    ("streams_list", "expected_url"),
+    [
+        (
+            [
+                {"main": False, "official": True, "embed_url": "https://example.com/other"},
+                {"main": True, "official": True, "embed_url": "https://example.com/main"},
+            ],
+            "https://example.com/main",
+        ),
+        ([{"main": True, "official": True, "embed_url": None}], None),
+        ([], None),
+        ([{"main": True, "official": False, "embed_url": "https://example.com/unofficial"}], None),
+        ([{"main": False, "official": True, "embed_url": "https://example.com/non-main"}], None),
+        (None, None),
+    ],
+)
+def test_match_to_row_maps_main_official_stream_embed(streams_list, expected_url):
+    row = scrape.match_to_row({"id": 1, "streams_list": streams_list})
+
+    assert row["live_embed_url"] == expected_url
+    assert "complete" not in row
 
 
 def test_videogame_to_row_current_version_can_be_none():
@@ -1193,6 +1296,7 @@ def test_tournament_query_context_order_and_lifecycle_descriptions():
         live = queries["live_matches"]
         assert live["title"] == "Live Matches"
         assert "running" in live["description"].lower()
+        assert "main official stream embed" in live["description"].lower()
         assert "m.status = 'running'" in live["sql"]
     finally:
         connection.close()
