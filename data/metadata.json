@@ -5,6 +5,13 @@
     "license_url": "https://opendatacommons.org/licenses/odbl/",
     "source": "PandaScore API",
     "source_url": "https://pandascore.co",
+    "about": "Made by jerrynsh.com",
+    "about_url": "https://jerrynsh.com/",
+    "plugins": {
+        "datasette-block-robots": {
+            "allow_only_index": true
+        }
+    },
     "databases": {
         "esports": {
             "queries": {
@@ -128,15 +135,11 @@
                     "sortable_columns": ["score"],
                     "facets": ["opponent_type", "is_winner"],
                     "description": "Teams or players participating in a match, with scores and win/loss result"
+                },
+                "sqlite_sequence": {
+                    "allow": false
                 }
             }
-        }
-    },
-    "about": "Made by jerrynsh.com",
-    "about_url": "https://jerrynsh.com/",
-    "plugins": {
-        "datasette-block-robots": {
-            "allow_only_index": true
         }
     }
 }
