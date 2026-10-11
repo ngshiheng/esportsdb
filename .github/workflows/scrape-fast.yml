@@ -79,8 +79,8 @@ jobs:
               continue-on-error: true
               run: uv run --script scrape.py --validate-db --db "$DB_PATH" --outcome /tmp/scrape-outcome.json
 
-            # Matches table must be non-empty - a fully empty DB indicates
-            # the scraper failed silently or the DB was not downloaded correctly.
+            # Matches table must be non-empty; row rejection policy is evaluated
+            # by the scraper outcome and integrity validation above.
             - name: Validate DB
               id: validate_db
               if: always()

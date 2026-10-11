@@ -39,8 +39,9 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Iterator
@@ -66,6 +67,8 @@ INITIAL_BACKOFF_SECONDS = 2.0
 INTER_PAGE_DELAY_SECONDS = (
     5.0  # keeps throughput ~720 req/hr, well under the 1k/hr limit
 )
+MAX_REJECTION_RATE = 0.5
+MAX_REJECTION_EXAMPLES = 100
 
 
 ALL_RESOURCES = (
@@ -172,6 +175,44 @@ class PageResult:
 
 
 @dataclass(frozen=True)
+class RowRejection:
+    """A compact, structured explanation for a rejected source row."""
+
+    resource: str
+    record_id: int | str | None
+    reason: str
+    detail: str
+    parent_type: str | None = None
+    parent_id: int | str | None = None
+
+
+@dataclass(frozen=True)
+
+class ResourceOutcome:
+    """Final source-record accounting for one configured resource."""
+
+    attempted: int
+    persisted: int
+    rejected: int
+    rejection_reasons: dict[str, int]
+    rejection_examples: tuple[RowRejection, ...]
+
+    @property
+    def rejection_rate(self) -> float | None:
+        return self.rejected / self.attempted if self.attempted else None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "attempted": self.attempted,
+            "persisted": self.persisted,
+            "rejected": self.rejected,
+            "rejection_rate": self.rejection_rate,
+            "rejection_reasons": self.rejection_reasons,
+            "rejection_examples": [asdict(rejection) for rejection in self.rejection_examples],
+        }
+
+
+@dataclass(frozen=True)
 class ScrapeResult:
     """Outcome for one resource scrape."""
 
@@ -183,6 +224,15 @@ class ScrapeResult:
     missing_opponents: int = 0
     unsupported_opponents: int = 0
     records_to_retry: tuple[dict[str, Any], ...] = ()
+    row_rejections: tuple[RowRejection, ...] = ()
+    relationship_rejections: tuple[RowRejection, ...] = ()
+    unique_attempted: int | None = None
+    attempted_ids: tuple[int | str, ...] = ()
+    persisted_ids: tuple[int | str, ...] = ()
+    rejected_ids: tuple[int | str, ...] = ()
+    rejection_reasons_by_id: dict[int | str, str] = field(default_factory=dict)
+    relationship_rejection_keys: tuple[tuple[int | str | None, int | str, str, str], ...] = ()
+    relationship_rejection_reasons: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -551,6 +601,48 @@ class Database:
             is not None
         )
 
+    def missing_opponent_parent(self, opponent_id: int, opponent_type: str) -> bool:
+        table = {"team": "teams", "player": "players"}.get(opponent_type.casefold())
+        if table is None:
+            return False
+        return (
+            self._connection.execute(
+                f"SELECT 1 FROM {table} WHERE id = ?", (opponent_id,)
+            ).fetchone()
+            is None
+        )
+
+    def missing_parent(
+        self, table: str, row: dict[str, Any]
+    ) -> tuple[str, int | str] | None:
+        parent_fields = {
+            "leagues": (("videogame_id", "videogames"),),
+            "series": (("league_id", "leagues"), ("videogame_id", "videogames")),
+            "tournaments": (
+                ("serie_id", "series"),
+                ("league_id", "leagues"),
+                ("videogame_id", "videogames"),
+            ),
+            "matches": (
+                ("tournament_id", "tournaments"),
+                ("serie_id", "series"),
+                ("league_id", "leagues"),
+                ("videogame_id", "videogames"),
+            ),
+            "teams": (("current_videogame_id", "videogames"),),
+            "players": (
+                ("current_team_id", "teams"),
+                ("current_videogame_id", "videogames"),
+            ),
+        }
+        for field_name, parent_table in parent_fields.get(table, ()):
+            parent_id = row.get(field_name)
+            if parent_id is not None and self._connection.execute(
+                f"SELECT 1 FROM {parent_table} WHERE id = ?", (parent_id,)
+            ).fetchone() is None:
+                return parent_table, parent_id
+        return None
+
     def commit(self) -> None:
         self._connection.commit()
 
@@ -649,13 +741,20 @@ def validate_database(
     if outcome_path is not None:
         try:
             outcome = json.loads(outcome_path.read_text())
-            unresolved_count = int(outcome.get("unresolved_relationships", -1))
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             issues.append(f"Cannot read valid scrape outcome {outcome_path}: {exc}")
         else:
-            if unresolved_count != 0:
+            if not isinstance(outcome, dict) or not isinstance(
+                outcome.get("threshold_exceeded"), bool
+            ):
                 issues.append(
-                    f"Scrape reported {unresolved_count} unresolved relationship(s)"
+                    f"Scrape outcome {outcome_path} is missing a valid threshold result"
+                )
+            elif outcome["threshold_exceeded"]:
+                failures = outcome.get("threshold_failures", [])
+                issues.append(
+                    "Scrape exceeded per-resource rejection threshold: "
+                    + ", ".join(map(str, failures))
                 )
 
     return DatabaseValidationResult(
@@ -856,30 +955,65 @@ def scrape_resource(
     attempted = persisted = fk_rejected = 0
     missing_opponents = unsupported_opponents = 0
     records_to_retry: list[dict[str, Any]] = []
+    row_rejections: list[RowRejection] = []
+    relationship_rejections: list[RowRejection] = []
+    relationship_rejection_keys: set[tuple[int | str | None, int | str, str, str]] = set()
+    relationship_rejection_reasons: Counter[str] = Counter()
+    rejection_reasons_by_id: dict[int | str, str] = {}
+    attempted_ids: set[int | str] = set()
+    persisted_ids: set[int | str] = set()
     api_incomplete = False
 
     def persist_record(record: dict[str, Any]) -> None:
         nonlocal attempted, persisted, fk_rejected
         nonlocal missing_opponents, unsupported_opponents
         attempted += 1
+        record_id = record.get("id")
+        if record_id is not None:
+            attempted_ids.add(record_id)
         row = to_row(record)
         try:
             db.upsert(table, row)
         except sqlite3.IntegrityError as exc:
             fk_rejected += 1
-            log.error(
-                "FK violation upserting into '%s' (record id=%s): %s; row=%s",
-                table,
-                record.get("id"),
-                exc,
-                row,
+            missing_parent = db.missing_parent(table, row)
+            if not isinstance(missing_parent, tuple):
+                missing_parent = None
+            if missing_parent is not None:
+                parent_type, parent_id = missing_parent
+                reason = "missing_parent"
+                detail = f"missing {parent_type} parent id={parent_id}"
+            else:
+                parent_type = parent_id = None
+                reason = "integrity_error"
+                detail = str(exc)
+            rejection = RowRejection(
+                resource=endpoint,
+                record_id=record.get("id"),
+                reason=reason,
+                detail=detail,
+                parent_type=parent_type,
+                parent_id=parent_id,
             )
+            if record_id is not None:
+                rejection_reasons_by_id[record_id] = reason
+            if len(row_rejections) < MAX_REJECTION_EXAMPLES:
+                row_rejections.append(rejection)
+                log.error(
+                    "Rejected %s record id=%s: reason=%s detail=%s",
+                    endpoint,
+                    record_id,
+                    reason,
+                    detail,
+                )
             if not skip_fk_errors:
                 raise
             records_to_retry.append(record)
             return
 
         persisted += 1
+        if record_id is not None:
+            persisted_ids.add(record_id)
         if not extra_rows_fn:
             return
 
@@ -891,48 +1025,95 @@ def scrape_resource(
                 record.get("id"),
             )
 
-        rejected = False
         for extra_row in extra_rows_fn(record):
             opponent_type = extra_row["opponent_type"]
             normalized_type = opponent_type.casefold()
             if normalized_type not in {"team", "player"}:
                 unsupported_opponents += 1
-                rejected = True
-                log.error(
-                    "Unsupported opponent type %r (match_id=%s, opponent_id=%s)",
-                    opponent_type,
-                    extra_row["match_id"],
-                    extra_row["opponent_id"],
+                rejection = RowRejection(
+                    resource=endpoint,
+                    record_id=record.get("id"),
+                    reason="unsupported_opponent_type",
+                    detail=f"unsupported opponent type {opponent_type!r}",
+                    parent_type=opponent_type,
+                    parent_id=extra_row["opponent_id"],
                 )
+                if len(relationship_rejections) < MAX_REJECTION_EXAMPLES:
+                    relationship_rejections.append(rejection)
+                    log.error(
+                        "Rejected opponent relationship match_id=%s opponent_id=%s: reason=%s detail=%s",
+                        extra_row["match_id"],
+                        extra_row["opponent_id"],
+                        rejection.reason,
+                        rejection.detail,
+                    )
+                relationship_rejection_keys.add(
+                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                )
+                relationship_rejection_reasons[rejection.reason] += 1
                 continue
             if not db.opponent_exists(extra_row["opponent_id"], opponent_type):
                 fk_rejected += 1
-                rejected = True
-                log.error(
-                    "Unresolved %s opponent id=%s for match_id=%s",
-                    opponent_type,
-                    extra_row["opponent_id"],
-                    extra_row["match_id"],
+                rejection = RowRejection(
+                    resource=endpoint,
+                    record_id=record.get("id"),
+                    reason="missing_opponent_parent",
+                    detail=f"missing {normalized_type} parent id={extra_row['opponent_id']}",
+                    parent_type=normalized_type,
+                    parent_id=extra_row["opponent_id"],
                 )
+                if len(relationship_rejections) < MAX_REJECTION_EXAMPLES:
+                    relationship_rejections.append(rejection)
+                    log.error(
+                        "Rejected opponent relationship match_id=%s opponent_id=%s: reason=%s detail=%s",
+                        extra_row["match_id"],
+                        extra_row["opponent_id"],
+                        rejection.reason,
+                        rejection.detail,
+                    )
+                relationship_rejection_keys.add(
+                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                )
+                relationship_rejection_reasons[rejection.reason] += 1
                 continue
             try:
                 db.upsert("match_opponents", extra_row)
             except sqlite3.IntegrityError as exc:
                 fk_rejected += 1
-                rejected = True
-                log.error(
-                    "FK violation upserting match_opponents "
-                    "(match_id=%s, opponent_id=%s, opponent_type=%s): %s; row=%s",
-                    extra_row["match_id"],
-                    extra_row["opponent_id"],
-                    opponent_type,
-                    exc,
-                    extra_row,
+                missing_parent = db.missing_opponent_parent(
+                    extra_row["opponent_id"], opponent_type
                 )
+                rejection = RowRejection(
+                    resource=endpoint,
+                    record_id=record.get("id"),
+                    reason=(
+                        "missing_opponent_parent"
+                        if missing_parent
+                        else "relationship_integrity_error"
+                    ),
+                    detail=(
+                        f"missing {normalized_type} parent id={extra_row['opponent_id']}"
+                        if missing_parent
+                        else str(exc)
+                    ),
+                    parent_type=normalized_type,
+                    parent_id=extra_row["opponent_id"],
+                )
+                if len(relationship_rejections) < MAX_REJECTION_EXAMPLES:
+                    relationship_rejections.append(rejection)
+                    log.error(
+                        "Rejected opponent relationship match_id=%s opponent_id=%s: reason=%s detail=%s",
+                        extra_row["match_id"],
+                        extra_row["opponent_id"],
+                        rejection.reason,
+                        rejection.detail,
+                    )
+                relationship_rejection_keys.add(
+                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                )
+                relationship_rejection_reasons[rejection.reason] += 1
                 if not skip_fk_errors:
                     raise
-        if rejected:
-            records_to_retry.append(record)
 
     try:
         if retry_records is None:
@@ -967,6 +1148,15 @@ def scrape_resource(
         missing_opponents=missing_opponents,
         unsupported_opponents=unsupported_opponents,
         records_to_retry=tuple(records_to_retry),
+        row_rejections=tuple(row_rejections),
+        relationship_rejections=tuple(relationship_rejections),
+        unique_attempted=len(attempted_ids),
+        attempted_ids=tuple(attempted_ids),
+        persisted_ids=tuple(persisted_ids),
+        rejected_ids=tuple(rejection_reasons_by_id),
+        rejection_reasons_by_id=rejection_reasons_by_id,
+        relationship_rejection_keys=tuple(relationship_rejection_keys),
+        relationship_rejection_reasons=dict(relationship_rejection_reasons),
     )
     log.info(
         "/%s outcome: attempted=%d persisted=%d fk_rejected=%d unresolved=%d "
@@ -1051,8 +1241,7 @@ RESOURCE_CONFIG: dict[str, ResourceConfig] = {
 
 
 def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
-    """Scrape configured resources, retry deferred rows, and write an outcome."""
-    unresolved_relationships = 0
+    """Scrape configured resources, retry rejected rows once, and write outcomes."""
     api_incomplete = False
     missing_opponents = 0
     unsupported_opponents = 0
@@ -1066,14 +1255,17 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
     try:
         db.ensure_schema()
         started_at = time.monotonic()
+        outcomes: dict[str, ResourceOutcome] = {}
+        relationships: dict[str, dict[str, Any]] = {}
         deferred: list[tuple[str, ResourceConfig, ScrapeResult]] = []
 
         def scrape_one(resource: str, cfg: ResourceConfig) -> ScrapeResult:
             nonlocal api_incomplete, missing_opponents, unsupported_opponents
+            endpoint = cfg.endpoint or resource
             result = scrape_resource(
                 client,
                 db,
-                endpoint=cfg.endpoint or resource,
+                endpoint=endpoint,
                 table=cfg.table,
                 to_row=cfg.to_row,
                 extra_rows_fn=cfg.extra_rows_fn,
@@ -1082,6 +1274,45 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
             api_incomplete |= result.api_incomplete
             missing_opponents += result.missing_opponents
             unsupported_opponents += result.unsupported_opponents
+            outcomes[resource] = ResourceOutcome(
+                attempted=result.unique_attempted or result.attempted,
+                persisted=len(result.persisted_ids) or result.persisted,
+                rejected=len(result.rejected_ids) or len({r.record_id for r in result.row_rejections}),
+                rejection_reasons=(
+                    dict(Counter(result.rejection_reasons_by_id.values()))
+                    if result.rejection_reasons_by_id
+                    else dict(Counter(r.reason for r in result.row_rejections))
+                ),
+                rejection_examples=result.row_rejections[:MAX_REJECTION_EXAMPLES],
+            )
+            prior_relationships = relationships.get(resource, {})
+            unique_relationships = {
+                (r.record_id, r.parent_type, r.parent_id, r.reason): r
+                for r in result.relationship_rejections
+            }
+            relationships[resource] = {
+                "rejected": len(
+                    set(prior_relationships.get("rejection_keys", ()))
+                    | set(result.relationship_rejection_keys)
+                ),
+                "rejection_reasons": dict(result.relationship_rejection_reasons),
+                "rejection_keys": tuple(
+                    set(prior_relationships.get("rejection_keys", ()))
+                    | set(result.relationship_rejection_keys)
+                ),
+                "rejection_objects": (
+                    *prior_relationships.get("rejection_objects", ()),
+                    *unique_relationships.values(),
+                ),
+                "rejection_examples": [
+                    asdict(r) for r in result.relationship_rejections[:MAX_REJECTION_EXAMPLES]
+                ],
+                "missing_opponents": result.missing_opponents,
+                "unsupported_opponents": prior_relationships.get("unsupported_opponents", 0) + sum(
+                    r.reason == "unsupported_opponent_type"
+                    for r in (*prior_relationships.get("rejection_objects", ()), *result.relationship_rejections)
+                ),
+            }
             return result
 
         for resource in config.resources:
@@ -1093,40 +1324,15 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
             if result.records_to_retry:
                 deferred.append((resource, cfg, result))
 
+        # Requested resources have now been fetched, so retry only the rejected
+        # records once against the parents already available in the candidate.
+        # Never recursively scrape broad parent catalogs for an isolated reject.
         for resource, cfg, first_result in deferred:
-            refreshed: set[str] = set()
-
-            def refresh_dependencies(parent: str) -> None:
-                nonlocal unresolved_relationships
-                if parent in refreshed:
-                    return
-                refreshed.add(parent)
-                for ancestor in RESOURCE_DEPENDENCIES.get(parent, ()):
-                    refresh_dependencies(ancestor)
-                parent_cfg = RESOURCE_CONFIG.get(parent)
-                if parent_cfg is not None:
-                    parent_result = scrape_one(parent, parent_cfg)
-                    unresolved_relationships += parent_result.unresolved_relationships
-
-            for parent in RESOURCE_DEPENDENCIES.get(resource, ()):
-                refresh_dependencies(parent)
-
-            if cfg.extra_rows_fn is match_opponent_rows:
-                opponent_parents = {
-                    row["opponent_type"].casefold()
-                    for record in first_result.records_to_retry
-                    for row in match_opponent_rows(record)
-                    if row["opponent_type"].casefold() in {"team", "player"}
-                }
-                for parent in opponent_parents:
-                    parent_cfg = RESOURCE_CONFIG[parent + "s"]
-                    parent_result = scrape_one(parent + "s", parent_cfg)
-                    unresolved_relationships += parent_result.unresolved_relationships
-
+            endpoint = cfg.endpoint or resource
             retry_result = scrape_resource(
                 client,
                 db,
-                endpoint=cfg.endpoint or resource,
+                endpoint=endpoint,
                 table=cfg.table,
                 to_row=cfg.to_row,
                 extra_rows_fn=cfg.extra_rows_fn,
@@ -1134,16 +1340,115 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
                 retry_records=first_result.records_to_retry,
             )
             api_incomplete |= retry_result.api_incomplete
-            missing_opponents += retry_result.missing_opponents
-            unsupported_opponents += retry_result.unsupported_opponents
-            unresolved_relationships += retry_result.unresolved_relationships
+            previous = outcomes[resource]
+            final_rejections = {r.record_id: r for r in retry_result.row_rejections}
+            final_rejection_reasons = dict(retry_result.rejection_reasons_by_id)
+            recovered_ids = set(retry_result.persisted_ids)
+            first_rejection_reasons = dict(first_result.rejection_reasons_by_id)
+            for record_id, reason in first_rejection_reasons.items():
+                if record_id not in recovered_ids:
+                    final_rejection_reasons.setdefault(record_id, reason)
+            for rejection in first_result.row_rejections:
+                if rejection.record_id not in recovered_ids:
+                    final_rejections.setdefault(rejection.record_id, rejection)
+            attempted_ids = set(first_result.attempted_ids)
+            attempted_ids.update(retry_result.attempted_ids)
+            attempted = len(attempted_ids) or first_result.attempted
+            persisted_ids = set(first_result.persisted_ids)
+            persisted_ids.update(retry_result.persisted_ids)
+            persisted = len(persisted_ids) or (previous.persisted + retry_result.persisted)
+            outcomes[resource] = ResourceOutcome(
+                attempted=attempted,
+                persisted=persisted,
+                rejected=(
+                    len(final_rejection_reasons)
+                    if final_rejection_reasons
+                    else len(final_rejections)
+                ),
+                rejection_reasons=(
+                    dict(Counter(final_rejection_reasons.values()))
+                    if final_rejection_reasons
+                    else dict(Counter(r.reason for r in final_rejections.values()))
+                ),
+                rejection_examples=tuple(final_rejections.values())[:MAX_REJECTION_EXAMPLES],
+            )
+            relationship_rejections = retry_result.relationship_rejections
+            prior_relationship_objects = relationships[resource].get("rejection_objects", ())
+            combined_relationships = tuple(
+                {
+                    (r.record_id, r.parent_type, r.parent_id, r.reason): r
+                    for r in (*prior_relationship_objects, *relationship_rejections)
+                }.values()
+            )
+            relationships[resource]["rejected"] = len(combined_relationships)
+            relationships[resource]["rejection_reasons"] = dict(
+                Counter(r.reason for r in combined_relationships)
+            )
+            relationships[resource]["rejection_examples"] = [
+                asdict(r) for r in combined_relationships[:MAX_REJECTION_EXAMPLES]
+            ]
+            relationships[resource]["unsupported_opponents"] = sum(
+                r.reason == "unsupported_opponent_type" for r in combined_relationships
+            )
+
+        threshold_failures = {
+            resource: outcome
+            for resource, outcome in outcomes.items()
+            if outcome.rejection_rate is not None
+            and outcome.rejection_rate > MAX_REJECTION_RATE
+        }
+        public_relationships = {
+            resource: {
+                key: value
+                for key, value in metrics.items()
+                if key != "rejection_objects"
+            }
+            for resource, metrics in relationships.items()
+        }
+        for resource, outcome in outcomes.items():
+            rate = outcome.rejection_rate
+            log.info(
+                "Resource %s records: attempted=%d persisted=%d rejected=%d "
+                "rejection_rate=%s reasons=%s",
+                resource,
+                outcome.attempted,
+                outcome.persisted,
+                outcome.rejected,
+                "n/a" if rate is None else f"{rate:.1%}",
+                outcome.rejection_reasons,
+            )
+            for rejection in outcome.rejection_examples:
+                log.error(
+                    "Rejected source row: resource=%s record_id=%s reason=%s detail=%s",
+                    rejection.resource,
+                    rejection.record_id,
+                    rejection.reason,
+                    rejection.detail,
+                )
+        for resource, outcome in threshold_failures.items():
+            rate = outcome.rejection_rate or 0.0
+            log.error(
+                "Resource %s exceeded rejection threshold: %d/%d rejected (%.1f%%; "
+                "threshold > %.1f%%), reasons=%s examples=%s",
+                resource,
+                outcome.rejected,
+                outcome.attempted,
+                rate * 100,
+                MAX_REJECTION_RATE * 100,
+                outcome.rejection_reasons,
+                [asdict(r) for r in outcome.rejection_examples[:5]],
+            )
 
         if outcome_path is not None:
             outcome_path.parent.mkdir(parents=True, exist_ok=True)
             outcome_path.write_text(
                 json.dumps(
                     {
-                        "unresolved_relationships": unresolved_relationships,
+                        "resources": {name: outcome.to_json() for name, outcome in outcomes.items()},
+                        "relationships": public_relationships,
+                        "threshold": MAX_REJECTION_RATE,
+                        "threshold_exceeded": bool(threshold_failures),
+                        "threshold_failures": list(threshold_failures),
                         "api_incomplete": api_incomplete,
                         "missing_opponents": missing_opponents,
                         "unsupported_opponents": unsupported_opponents,
@@ -1157,7 +1462,7 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
         client.close()
         db.close()
 
-    return unresolved_relationships
+    return int(bool(threshold_failures))
 
 
 def _parse_since(value: str) -> str:
@@ -1303,10 +1608,10 @@ def main(
                 )
         return
 
-    unresolved = run_scrape(
+    failed = run_scrape(
         _build_config(api_key, db, resources, page_size, since, page_delay), outcome
     )
-    if unresolved:
+    if failed:
         raise typer.Exit(code=1)
 
 

@@ -43,7 +43,11 @@ scrape-slow:    ## refresh reference data - leagues, series, tournaments, teams,
 
 .PHONY: scrape-history
 scrape-history:    ## one-time full historical match backfill (slow, hours - run manually once).
-	@$(UV) run --script scrape.py --db $(SQLITE_FILE) --resource matches --page-delay 3
+	@$(UV) run --script scrape.py --db $(SQLITE_FILE) --resource matches --page-delay 3 --outcome $(SCRAPE_OUTCOME)
+
+.PHONY: validate-db
+validate-db:    ## validate SQLite integrity, foreign keys, and optional scrape outcome.
+	@$(UV) run --script scrape.py --validate-db --db $(SQLITE_FILE) --outcome $(SCRAPE_OUTCOME)
 
 .PHONY: test
 test:   ## run unit tests.

@@ -441,6 +441,7 @@ def test_scrape_resource_reports_skipped_rows_as_unpersisted():
     assert result.fk_rejected == 1
     assert result.unresolved_relationships == 1
     assert [record["id"] for record in result.records_to_retry] == [1]
+    assert result.row_rejections[0].reason == "integrity_error"
     mock_db.commit.assert_called_once()
 
 
@@ -467,8 +468,10 @@ def test_scrape_resource_rejects_unresolved_opponent_reference():
         )
 
     assert result.fk_rejected == 1
-    assert result.unresolved_relationships == 1
+    assert result.unresolved_relationships == 0
+    assert result.persisted == 1
     assert mock_db.upsert.call_args_list == [call("matches", {"id": 7})]
+    assert result.relationship_rejections[0].reason == "missing_opponent_parent"
 
 
 def test_database_match_opponent_retry_does_not_replace_existing_row(tmp_path):
@@ -746,7 +749,8 @@ def test_run_scrape_writes_partial_api_outcome_without_fk_failures(tmp_path):
     assert unresolved == 0
     outcome = json.loads(outcome_path.read_text())
     assert outcome["api_incomplete"] is True
-    assert outcome["unresolved_relationships"] == 0
+    assert outcome["threshold_exceeded"] is False
+    assert outcome["resources"]["videogames"]["attempted"] == 0
 
 
 def test_validate_database_rejects_foreign_key_violations(tmp_path):
@@ -765,6 +769,60 @@ def test_validate_database_rejects_foreign_key_violations(tmp_path):
     assert result.foreign_key_violations == 1
 
 
+def test_scrape_resource_keeps_valid_rows_and_reports_missing_parent(tmp_path):
+    db = scrape.Database(tmp_path / "candidate.db")
+    db.ensure_schema()
+    db.upsert("videogames", {"id": 1, "name": "game", "slug": "game"})
+    db.upsert("leagues", {"id": 2, "name": "league", "slug": "league"})
+    db.upsert("series", {"id": 3, "name": "series", "league_id": 2})
+    client = make_client()
+    records = [{"id": 10, "serie_id": 3}, {"id": 11, "serie_id": 999}]
+
+    with patch.object(client, "fetch_all", return_value=iter([records])):
+        result = scrape.scrape_resource(
+            client=client,
+            db=db,
+            endpoint="tournaments/upcoming",
+            to_row=lambda record: record,
+            table="tournaments",
+            skip_fk_errors=True,
+        )
+
+    saved = db._connection.execute(
+        "SELECT id FROM tournaments ORDER BY id"
+    ).fetchall()
+    db.close()
+    assert saved == [(10,)]
+    assert result.attempted == 2
+    assert result.persisted == 1
+    assert result.row_rejections == (
+        scrape.RowRejection(
+            "tournaments/upcoming", 11, "missing_parent", "missing series parent id=999", "series", 999
+        ),
+    )
+
+
+def test_scrape_resource_keeps_rejection_metrics_bounded():
+    client = make_client()
+    mock_db = MagicMock()
+    mock_db.upsert.side_effect = [sqlite3.IntegrityError("invalid row") for _ in range(105)]
+    records = [{"id": i} for i in range(105)]
+
+    with patch.object(client, "fetch_all", return_value=iter([records])):
+        result = scrape.scrape_resource(
+            client=client,
+            db=mock_db,
+            endpoint="teams",
+            to_row=lambda record: record,
+            table="teams",
+            skip_fk_errors=True,
+        )
+
+    assert result.unique_attempted == 105
+    assert len(result.rejected_ids) == 105
+    assert len(result.row_rejections) == scrape.MAX_REJECTION_EXAMPLES
+
+
 def test_validate_database_allows_valid_partial_api_refresh(tmp_path):
     path = tmp_path / "valid.db"
     outcome = tmp_path / "outcome.json"
@@ -776,7 +834,7 @@ def test_validate_database_allows_valid_partial_api_refresh(tmp_path):
         "INSERT INTO child(id, parent_id) VALUES (2, 1);"
     )
     connection.close()
-    outcome.write_text('{"unresolved_relationships": 0, "api_incomplete": true}')
+    outcome.write_text('{"threshold_exceeded": false, "api_incomplete": true}')
 
     result = scrape.validate_database(path, outcome)
 
@@ -785,7 +843,7 @@ def test_validate_database_allows_valid_partial_api_refresh(tmp_path):
     assert result.foreign_key_violations == 0
 
 
-def test_validate_database_rejects_unresolved_outcome(tmp_path):
+def test_validate_database_rejects_malformed_scrape_outcome(tmp_path):
     path = tmp_path / "valid.db"
     outcome = tmp_path / "outcome.json"
     connection = sqlite3.connect(path)
@@ -796,7 +854,75 @@ def test_validate_database_rejects_unresolved_outcome(tmp_path):
     result = scrape.validate_database(path, outcome)
 
     assert not result.valid
-    assert any("unresolved relationship" in issue for issue in result.issues)
+    assert any("threshold result" in issue for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("rejected", "expected_failure"),
+    [(0, False), (1, False), (2, False), (3, True)],
+)
+def test_resource_rejection_threshold_is_strictly_greater_than_half(
+    rejected, expected_failure
+):
+    outcome = scrape.ResourceOutcome(
+        attempted=4,
+        persisted=4 - rejected,
+        rejected=rejected,
+        rejection_reasons={"missing_parent": rejected} if rejected else {},
+        rejection_examples=(),
+    )
+
+    assert ((outcome.rejection_rate or 0.0) > scrape.MAX_REJECTION_RATE) is expected_failure
+
+
+def test_zero_attempt_resource_has_no_rejection_rate():
+    outcome = scrape.ResourceOutcome(0, 0, 0, {}, ())
+
+    assert outcome.rejection_rate is None
+
+
+def test_validate_database_allows_partial_rejections_at_or_below_threshold(tmp_path):
+    path = tmp_path / "partial.db"
+    outcome_path = tmp_path / "outcome.json"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE item(id INTEGER PRIMARY KEY)")
+    connection.close()
+    outcome_path.write_text(
+        json.dumps(
+            {
+                "threshold_exceeded": False,
+                "resources": {
+                    "tournaments": {
+                        "attempted": 2,
+                        "persisted": 1,
+                        "rejected": 1,
+                        "rejection_rate": 0.5,
+                        "rejection_reasons": {"missing_parent": 1},
+                    }
+                },
+            }
+        )
+    )
+
+    result = scrape.validate_database(path, outcome_path)
+
+    assert result.valid
+
+
+def test_validate_database_rejects_threshold_exceeded_outcome(tmp_path):
+    path = tmp_path / "threshold.db"
+    outcome_path = tmp_path / "outcome.json"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE item(id INTEGER PRIMARY KEY)")
+    connection.close()
+    outcome_path.write_text(
+        '{"threshold_exceeded": true, "threshold_failures": ["tournaments"]}'
+    )
+
+    result = scrape.validate_database(path, outcome_path)
+
+    assert not result.valid
+    assert any("tournaments" in issue for issue in result.issues)
 
 
 def test_validate_database_accepts_case_variants_and_rejects_unknown_type(tmp_path):
@@ -836,12 +962,14 @@ def test_validate_database_rejects_unresolved_scrape_outcome(tmp_path):
     connection.execute("CREATE TABLE item(id INTEGER PRIMARY KEY)")
     connection.commit()
     connection.close()
-    outcome_path.write_text('{"unresolved_relationships": 2}')
+    outcome_path.write_text(
+        '{"threshold_exceeded": true, "threshold_failures": ["matches"]}'
+    )
 
     result = scrape.validate_database(db_path, outcome_path)
 
     assert result.valid is False
-    assert any("unresolved relationship" in issue for issue in result.issues)
+    assert any("exceeded per-resource rejection threshold" in issue for issue in result.issues)
 
 
 def test_fetch_all_live_request_sleeps_between_full_pages():
@@ -948,7 +1076,7 @@ def test_scrape_resource_calls_extra_rows_fn_and_upserts_junction_rows():
     assert tables_upserted == ["matches", "match_opponents"]
 
 
-def test_run_scrape_retries_fk_rejected_record_after_refreshing_parents():
+def test_run_scrape_retries_fk_rejected_record_without_refreshing_parent_catalogs(tmp_path):
     player = {
         "id": 4,
         "name": "player",
@@ -957,7 +1085,7 @@ def test_run_scrape_retries_fk_rejected_record_after_refreshing_parents():
     }
     config = scrape.ScraperConfig(
         api_key="test",
-        db_path=Path("unused.db"),
+        db_path=tmp_path / "unused.db",
         resources=("players",),
         page_size=100,
     )
@@ -965,9 +1093,21 @@ def test_run_scrape_retries_fk_rejected_record_after_refreshing_parents():
     db = MagicMock()
     first_result = scrape.ScrapeResult(
         attempted=1,
+        unique_attempted=1,
         fk_rejected=1,
         unresolved_relationships=1,
         records_to_retry=(player,),
+        row_rejections=(
+            scrape.RowRejection("players", 4, "missing_parent", "missing teams parent id=9", "teams", 9),
+        ),
+        attempted_ids=(4,),
+    )
+    retry_result = scrape.ScrapeResult(
+        attempted=1,
+        unique_attempted=1,
+        persisted=1,
+        attempted_ids=(4,),
+        persisted_ids=(4,),
     )
 
     with (
@@ -976,22 +1116,15 @@ def test_run_scrape_retries_fk_rejected_record_after_refreshing_parents():
         patch.object(
             scrape,
             "scrape_resource",
-            side_effect=[
-                first_result,
-                scrape.ScrapeResult(attempted=1, persisted=1),
-                scrape.ScrapeResult(attempted=1, persisted=1),
-                scrape.ScrapeResult(attempted=1, persisted=1),
-            ],
+            side_effect=[first_result, retry_result],
         ) as mock_scrape,
     ):
-        unresolved = scrape.run_scrape(config)
+        failed = scrape.run_scrape(config)
 
-    assert unresolved == 0
-    assert mock_scrape.call_count == 4
+    assert failed == 0
+    assert mock_scrape.call_count == 2
     assert [call.kwargs.get("endpoint") for call in mock_scrape.call_args_list] == [
         "players",
-        "videogames",
-        "teams",
         "players",
     ]
     assert mock_scrape.call_args_list[-1].kwargs["retry_records"] == (player,)

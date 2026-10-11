@@ -54,7 +54,6 @@ jobs:
               continue-on-error: false
 
             - name: Run scrape-slow
-              continue-on-error: true
               env:
                   PANDASCORE_API_KEY: ${{ secrets.PANDASCORE_API_KEY }}
                   SCRAPE_OUTCOME: /tmp/scrape-outcome.json
