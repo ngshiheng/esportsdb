@@ -89,7 +89,7 @@ erDiagram
         text status
         text match_type
         text scheduled_at
-        text live_embed_url
+        text streams_raw_url
         int tournament_id FK
         int serie_id FK
         int league_id FK
@@ -137,7 +137,7 @@ erDiagram
 
 All tables use `INSERT OR REPLACE` upserts. `PRAGMA foreign_keys=ON` and `PRAGMA journal_mode=WAL` are set on every connection.
 
-The scraper upgrades an existing database in place before scraping: it removes the obsolete `matches.complete` and `tournaments.full_name` columns while preserving accumulated match history and foreign-key relationships. Scheduled workflows restore the latest database artifact first, then validate the upgraded candidate before publishing it; a failed migration or validation leaves the previous artifact available for the next run.
+The scraper upgrades an existing database in place before scraping: it renames `matches.live_embed_url` to `matches.streams_raw_url` and removes the obsolete `matches.complete` and `tournaments.full_name` columns while preserving accumulated match history and foreign-key relationships. Match resources select a direct watch URL from PandaScore's stream list, preferring main+official, then official, then main streams. Scheduled workflows restore the latest database artifact first, then validate the upgraded candidate before publishing it; a failed migration or validation leaves the previous artifact available for the next run.
 
 ## FK Dependency Order
 

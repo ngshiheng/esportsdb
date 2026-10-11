@@ -505,6 +505,9 @@ def test_database_match_opponent_retry_does_not_replace_existing_row(tmp_path):
 def test_ensure_schema_migrates_legacy_columns_and_is_repeatable(tmp_path):
     db = scrape.Database(tmp_path / "legacy.db")
     db.ensure_schema()
+    db._connection.execute(
+        "ALTER TABLE matches RENAME COLUMN streams_raw_url TO live_embed_url"
+    )
     db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
     db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
     db.commit()
@@ -522,13 +525,13 @@ def test_ensure_schema_migrates_legacy_columns_and_is_repeatable(tmp_path):
 
     assert "complete" not in columns["matches"]
     assert "full_name" not in columns["tournaments"]
+    assert "live_embed_url" not in columns["matches"]
+    assert "streams_raw_url" in columns["matches"]
 
 
 def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path):
     db = scrape.Database(tmp_path / "populated-legacy.db")
     db.ensure_schema()
-    db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
-    db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
     db.upsert("videogames", {"id": 1, "name": "game", "slug": "game"})
     db.upsert(
         "leagues", {"id": 2, "name": "league", "slug": "league", "videogame_id": 1}
@@ -539,7 +542,6 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
         {
             "id": 4,
             "name": "event",
-            "full_name": "obsolete value",
             "serie_id": 3,
             "league_id": 2,
             "videogame_id": 1,
@@ -553,7 +555,7 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
             "serie_id": 3,
             "league_id": 2,
             "videogame_id": 1,
-            "complete": 1,
+            "streams_raw_url": "https://www.twitch.tv/legacy",
         },
     )
     db.upsert("teams", {"id": 6, "name": "team", "slug": "team"})
@@ -568,6 +570,14 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
         },
     )
     db.commit()
+    db._connection.execute(
+        "ALTER TABLE matches RENAME COLUMN streams_raw_url TO live_embed_url"
+    )
+    db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
+    db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
+    db._connection.execute("UPDATE matches SET complete = 1 WHERE id = 5")
+    db._connection.execute("UPDATE tournaments SET full_name = 'obsolete value' WHERE id = 4")
+    db.commit()
 
     db.ensure_schema()
 
@@ -576,6 +586,9 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
         for table in ("videogames", "leagues", "series", "tournaments", "matches", "teams", "match_opponents")
     }
     foreign_key_violations = db._connection.execute("PRAGMA foreign_key_check").fetchall()
+    migrated_url = db._connection.execute(
+        "SELECT streams_raw_url FROM matches WHERE id = 5"
+    ).fetchone()[0]
     db.close()
 
     assert counts == {
@@ -588,6 +601,27 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
         "match_opponents": 1,
     }
     assert foreign_key_violations == []
+    assert migrated_url == "https://www.twitch.tv/legacy"
+
+
+def test_ensure_schema_rejects_conflicting_stream_url_columns_without_data_loss(tmp_path):
+    db = scrape.Database(tmp_path / "conflicting.db")
+    db.ensure_schema()
+    db._connection.execute("ALTER TABLE matches ADD COLUMN live_embed_url TEXT")
+    db._connection.execute(
+        "INSERT INTO matches(id, streams_raw_url, live_embed_url) "
+        "VALUES (1, 'new-value', 'old-value')"
+    )
+    db.commit()
+
+    with pytest.raises(sqlite3.DatabaseError, match="both live_embed_url and streams_raw_url"):
+        db.ensure_schema()
+
+    values = db._connection.execute(
+        "SELECT streams_raw_url, live_embed_url FROM matches WHERE id = 1"
+    ).fetchone()
+    db.close()
+    assert values == ("new-value", "old-value")
 
 
 def test_scrape_resource_reports_missing_opponents_without_fk_rejection():
@@ -1079,22 +1113,37 @@ def test_tournament_to_row_omits_unsupported_full_name():
     [
         (
             [
-                {"main": False, "official": True, "embed_url": "https://example.com/other"},
-                {"main": True, "official": True, "embed_url": "https://example.com/main"},
+                {"main": False, "official": True, "raw_url": "https://example.com/official"},
+                {"main": True, "official": True, "raw_url": "https://example.com/main-official"},
+                {"main": True, "official": True, "raw_url": "https://example.com/second-main-official"},
+            ],
+            "https://example.com/main-official",
+        ),
+        (
+            [
+                {"main": True, "official": True, "raw_url": "  "},
+                {"main": False, "official": True, "raw_url": "https://example.com/official"},
+                {"main": True, "official": False, "raw_url": "https://example.com/main"},
+            ],
+            "https://example.com/official",
+        ),
+        (
+            [
+                {"main": True, "official": True, "raw_url": None},
+                {"main": True, "official": False, "raw_url": "https://example.com/main"},
             ],
             "https://example.com/main",
         ),
-        ([{"main": True, "official": True, "embed_url": None}], None),
+        ([{"main": False, "official": False, "raw_url": "https://example.com/neither"}], None),
+        ([{"main": True, "official": True, "raw_url": ""}], None),
         ([], None),
-        ([{"main": True, "official": False, "embed_url": "https://example.com/unofficial"}], None),
-        ([{"main": False, "official": True, "embed_url": "https://example.com/non-main"}], None),
         (None, None),
     ],
 )
-def test_match_to_row_maps_main_official_stream_embed(streams_list, expected_url):
+def test_match_to_row_maps_stream_raw_url_by_priority(streams_list, expected_url):
     row = scrape.match_to_row({"id": 1, "streams_list": streams_list})
 
-    assert row["live_embed_url"] == expected_url
+    assert row["streams_raw_url"] == expected_url
     assert "complete" not in row
 
 
@@ -1241,7 +1290,9 @@ def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
         ).fetchall()) == 1
 
         live_params = {"game": "", "tier": "", "tournament": ""}
-        assert len(connection.execute(queries["live_matches"]["sql"], live_params).fetchall()) == 1
+        live_cursor = connection.execute(queries["live_matches"]["sql"], live_params)
+        assert len(live_cursor.fetchall()) == 1
+        assert "streams_raw_url" in [column[0] for column in live_cursor.description]
         upcoming_params = {"game": "", "tier": "", "tournament": ""}
         assert len(connection.execute(
             queries["upcoming_matches"]["sql"], upcoming_params
@@ -1296,7 +1347,7 @@ def test_tournament_query_context_order_and_lifecycle_descriptions():
         live = queries["live_matches"]
         assert live["title"] == "Live Matches"
         assert "running" in live["description"].lower()
-        assert "main official stream embed" in live["description"].lower()
+        assert "direct watch url" in live["description"].lower()
         assert "m.status = 'running'" in live["sql"]
     finally:
         connection.close()

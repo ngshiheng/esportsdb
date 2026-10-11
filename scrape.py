@@ -422,7 +422,7 @@ SCHEMA_DDL: tuple[str, ...] = (
         original_scheduled_at   TEXT,
         forfeit                 INTEGER,
         detailed_stats          INTEGER,
-        live_embed_url          TEXT
+        streams_raw_url         TEXT
     )
     """,
     """
@@ -481,23 +481,35 @@ class Database:
         self._connection.execute("PRAGMA foreign_keys=ON")
 
     def ensure_schema(self) -> None:
-        for statement in SCHEMA_DDL:
-            self._connection.execute(statement)
-        self._migrate_obsolete_columns()
-        self._connection.commit()
+        with self._connection:
+            for statement in SCHEMA_DDL:
+                self._connection.execute(statement)
+            self._migrate_schema()
 
-    def _migrate_obsolete_columns(self) -> None:
-        """Remove legacy columns that have no corresponding upstream values."""
-        obsolete_columns = {
-            "matches": "complete",
-            "tournaments": "full_name",
+    def _migrate_schema(self) -> None:
+        """Upgrade legacy columns before any resource rows are written."""
+        match_columns = {
+            row[1] for row in self._connection.execute("PRAGMA table_info(matches)")
         }
-        for table, column in obsolete_columns.items():
+        if "live_embed_url" in match_columns and "streams_raw_url" in match_columns:
+            raise sqlite3.DatabaseError(
+                "Cannot migrate matches: both live_embed_url and streams_raw_url exist"
+            )
+        if "live_embed_url" in match_columns:
+            self._connection.execute(
+                "ALTER TABLE matches RENAME COLUMN live_embed_url TO streams_raw_url"
+            )
+
+        obsolete_columns = {
+            "matches": {"complete"},
+            "tournaments": {"full_name"},
+        }
+        for table, columns in obsolete_columns.items():
             existing_columns = {
                 row[1]
                 for row in self._connection.execute(f"PRAGMA table_info({table})")
             }
-            if column in existing_columns:
+            for column in columns & existing_columns:
                 self._connection.execute(
                     f"ALTER TABLE {table} DROP COLUMN {column}"
                 )
@@ -658,19 +670,27 @@ def _nested_id(record: dict[str, Any], key: str) -> int | None:
     return nested.get("id") if isinstance(nested, dict) else None
 
 
-def _main_official_stream_embed_url(record: dict[str, Any]) -> str | None:
+def _selected_stream_raw_url(record: dict[str, Any]) -> str | None:
     streams = record.get("streams_list")
     if not isinstance(streams, list):
         return None
-    for stream in streams:
-        if (
-            isinstance(stream, dict)
-            and stream.get("main") is True
-            and stream.get("official") is True
-        ):
-            embed_url = stream.get("embed_url")
-            return embed_url if isinstance(embed_url, str) else None
-    return None
+
+    def first_url(predicate: Callable[[dict[str, Any]], bool]) -> str | None:
+        for stream in streams:
+            if not isinstance(stream, dict) or not predicate(stream):
+                continue
+            raw_url = stream.get("raw_url")
+            if isinstance(raw_url, str) and raw_url.strip():
+                return raw_url
+        return None
+
+    url = first_url(lambda stream: stream.get("main") is True and stream.get("official") is True)
+    if url is not None:
+        return url
+    url = first_url(lambda stream: stream.get("official") is True)
+    if url is not None:
+        return url
+    return first_url(lambda stream: stream.get("main") is True)
 
 
 def videogame_to_row(record: dict[str, Any]) -> dict[str, Any]:
@@ -751,7 +771,7 @@ def match_to_row(record: dict[str, Any]) -> dict[str, Any]:
         "original_scheduled_at": record.get("original_scheduled_at"),
         "forfeit": record.get("forfeit"),
         "detailed_stats": record.get("detailed_stats"),
-        "live_embed_url": _main_official_stream_embed_url(record),
+        "streams_raw_url": _selected_stream_raw_url(record),
     }
 
 
