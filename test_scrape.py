@@ -83,6 +83,10 @@ def _metadata_fixture_connection():
             (5, "No Series Finished", 3, None, 1, 1, "finished", "2020-02-02", "2020-02-02", "2020-02-02"),
         ],
     )
+    connection.execute(
+        "UPDATE matches SET streams_raw_url = ? WHERE id = ?",
+        ("https://www.twitch.tv/test-stream", 2),
+    )
     connection.executemany(
         "INSERT INTO match_opponents(match_id, opponent_id, opponent_type, score, is_winner) "
         "VALUES (?, ?, 'Team', ?, ?)",
@@ -1239,16 +1243,18 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
         ).fetchall() == []
 
         schedule_query = queries["team_schedule"]["sql"]
-        schedule_columns = [
-            column[0] for column in connection.execute(
-                schedule_query, {"game": "", "team": ""}
-            ).description
-        ]
-        match_id_index = schedule_columns.index("match_id")
-        schedule_all = connection.execute(
+        schedule_cursor = connection.execute(
             schedule_query, {"game": "", "team": ""}
-        ).fetchall()
+        )
+        schedule_columns = [column[0] for column in schedule_cursor.description]
+        match_id_index = schedule_columns.index("match_id")
+        stream_url_index = schedule_columns.index("streams_raw_url")
+        schedule_all = schedule_cursor.fetchall()
         assert len(schedule_all) == 4
+        scheduled_with_url = next(row for row in schedule_all if row[match_id_index] == 2)
+        scheduled_without_url = next(row for row in schedule_all if row[match_id_index] == 1)
+        assert scheduled_with_url[stream_url_index] == "https://www.twitch.tv/test-stream"
+        assert scheduled_without_url[stream_url_index] is None
         assert len(schedule_all) <= 100
         game_schedule = connection.execute(
             schedule_query, {"game": "Other Game", "team": ""}
@@ -1294,9 +1300,13 @@ def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
         assert len(live_cursor.fetchall()) == 1
         assert "streams_raw_url" in [column[0] for column in live_cursor.description]
         upcoming_params = {"game": "", "tier": "", "tournament": ""}
-        assert len(connection.execute(
+        upcoming_cursor = connection.execute(
             queries["upcoming_matches"]["sql"], upcoming_params
-        ).fetchall()) == 1
+        )
+        upcoming_columns = [column[0] for column in upcoming_cursor.description]
+        upcoming_rows = [dict(zip(upcoming_columns, row)) for row in upcoming_cursor.fetchall()]
+        assert len(upcoming_rows) == 1
+        assert upcoming_rows[0]["streams_raw_url"] == "https://www.twitch.tv/test-stream"
     finally:
         connection.close()
 
