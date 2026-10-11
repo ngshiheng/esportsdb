@@ -12,11 +12,73 @@
 import json
 import sqlite3
 from pathlib import Path
+from statistics import median
+from time import perf_counter
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 import scrape
+
+
+def _metadata_fixture_connection():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("PRAGMA foreign_keys=ON")
+    for statement in scrape.SCHEMA_DDL:
+        connection.execute(statement)
+
+    connection.executemany(
+        "INSERT INTO videogames(id, name, slug) VALUES (?, ?, ?)",
+        [(1, "Test Game", "test-game"), (2, "Other Game", "other-game")],
+    )
+    connection.executemany(
+        "INSERT INTO leagues(id, name, slug, videogame_id) VALUES (?, ?, ?, ?)",
+        [(1, "Test League", "test-league", 1), (2, "Other League", "other-league", 2)],
+    )
+    connection.executemany(
+        "INSERT INTO series(id, name, league_id, videogame_id) VALUES (?, ?, ?, ?)",
+        [(1, "Test Series", 1, 1), (2, "Other Series", 2, 2)],
+    )
+    connection.executemany(
+        "INSERT INTO tournaments(id, name, begin_at, end_at, serie_id, league_id, "
+        "videogame_id, tier, winner_id, winner_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (1, "Test Cup", "2020-01-01", "2020-01-02", 1, 1, 1, "s", 1, "Team"),
+            (2, "Other Cup", "2020-01-01", "2020-01-02", 2, 2, 2, "a", 2, "Team"),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO teams(id, name, slug, acronym, current_videogame_id) VALUES (?, ?, ?, ?, ?)",
+        [
+            (1, "Test Team", "test-team", "TST", 1),
+            (2, "Rival Team", "rival-team", "RIV", 1),
+            (3, "Other Team", "other-team", "OTH", 2),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO players(id, name, active, current_team_id, current_videogame_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(1, "Active Player", 1, 1, 1), (2, "Inactive Player", 0, 1, 1),
+         (3, "Other Player", 1, 3, 2)],
+    )
+    connection.executemany(
+        "INSERT INTO matches(id, name, tournament_id, serie_id, league_id, videogame_id, "
+        "status, match_type, number_of_games, scheduled_at, begin_at, end_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'best_of', 3, ?, ?, ?)",
+        [
+            (1, "Test Live", 1, 1, 1, 1, "running", "2025-01-01", "2025-01-01", None),
+            (2, "Test Upcoming", 1, 1, 1, 1, "not_started", "2099-01-01", None, None),
+            (3, "Test Finished", 1, 1, 1, 1, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
+            (4, "Other Finished", 2, 2, 2, 2, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO match_opponents(match_id, opponent_id, opponent_type, score, is_winner) "
+        "VALUES (?, ?, 'Team', ?, ?)",
+        [(1, 1, 1, 1), (1, 2, 0, 0), (2, 1, None, None), (2, 2, None, None),
+         (3, 1, 2, 0), (3, 2, 3, 1), (4, 2, 2, 1), (4, 3, 1, 0)],
+    )
+    return connection
 
 
 def make_client(since=None, page_size=3, page_delay=0.0):
@@ -965,6 +1027,151 @@ def test_parse_since_strips_leading_trailing_whitespace():
     parsed = datetime.fromisoformat(result.replace("Z", "+00:00"))
     expected = datetime.now(timezone.utc) - timedelta(hours=24)
     assert abs((parsed - expected).total_seconds()) < 2
+
+
+def test_canned_queries_execute_with_blank_and_representative_parameters():
+    """Every canned query has valid SQL and accepts blank and representative filters."""
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    queries = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]
+    connection = _metadata_fixture_connection()
+    try:
+        for query in queries.values():
+            blank_params = {name: "" for name in query.get("params", [])}
+            representative_params = {
+                name: {
+                    "game": "Test Game",
+                    "year": "2025",
+                    "tier": "s",
+                    "tournament": "Test",
+                    "team": "Test",
+                }[name]
+                for name in query.get("params", [])
+            }
+            assert connection.execute(query["sql"], blank_params).description
+            connection.execute(query["sql"], representative_params).fetchall()
+    finally:
+        connection.close()
+
+
+def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    queries = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]
+    connection = _metadata_fixture_connection()
+    try:
+        roster_query = queries["team_roster"]["sql"]
+        roster_all = connection.execute(roster_query, {"game": "", "team": ""}).fetchall()
+        assert [row[3] for row in roster_all] == ["Active Player", "Other Player"]
+        assert len(roster_all) <= 100
+        assert [row[3] for row in connection.execute(
+            roster_query, {"game": "Test Game", "team": ""}
+        ).fetchall()] == ["Active Player"]
+        assert [row[3] for row in connection.execute(
+            roster_query, {"game": "", "team": "Other"}
+        ).fetchall()] == ["Other Player"]
+        assert [row[3] for row in connection.execute(
+            roster_query, {"game": "Other Game", "team": "Other"}
+        ).fetchall()] == ["Other Player"]
+        assert connection.execute(
+            roster_query, {"game": "Missing Game", "team": ""}
+        ).fetchall() == []
+
+        schedule_query = queries["team_schedule"]["sql"]
+        schedule_all = connection.execute(
+            schedule_query, {"game": "", "team": ""}
+        ).fetchall()
+        assert len(schedule_all) == 4
+        assert len(schedule_all) <= 100
+        game_schedule = connection.execute(
+            schedule_query, {"game": "Other Game", "team": ""}
+        ).fetchall()
+        assert len(game_schedule) == 1
+        team_schedule = connection.execute(
+            schedule_query, {"game": "", "team": "Test Team"}
+        ).fetchall()
+        assert {row[0] for row in team_schedule} == {1, 2, 3}
+        combined_schedule = connection.execute(
+            schedule_query, {"game": "Test Game", "team": "Test Team"}
+        ).fetchall()
+        assert {row[0] for row in combined_schedule} == {1, 2, 3}
+        assert connection.execute(
+            schedule_query, {"game": "Missing Game", "team": ""}
+        ).fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    queries = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]
+    connection = _metadata_fixture_connection()
+    try:
+        completed_query = queries["completed_matches"]["sql"]
+        all_completed = connection.execute(
+            completed_query, {"game": "", "tier": "", "tournament": ""}
+        ).fetchall()
+        assert len(all_completed) == 2
+        assert len(connection.execute(
+            completed_query, {"game": "Test Game", "tier": "", "tournament": ""}
+        ).fetchall()) == 1
+        assert len(connection.execute(
+            completed_query, {"game": "", "tier": "s", "tournament": ""}
+        ).fetchall()) == 1
+        assert len(connection.execute(
+            completed_query, {"game": "", "tier": "", "tournament": "Other"}
+        ).fetchall()) == 1
+
+        live_params = {"game": "", "tier": "", "tournament": ""}
+        assert len(connection.execute(queries["live_matches"]["sql"], live_params).fetchall()) == 1
+        upcoming_params = {"game": "", "tier": "", "tournament": ""}
+        assert len(connection.execute(
+            queries["upcoming_matches"]["sql"], upcoming_params
+        ).fetchall()) == 1
+    finally:
+        connection.close()
+
+
+def test_leagues_by_game_all_games_default_is_bounded_and_ordered():
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    database_path = Path(__file__).parent / "data" / "esports.db"
+    if not database_path.is_file():
+        pytest.skip("local esports.db snapshot is unavailable")
+    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]["leagues_by_game"]
+    connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(query["sql"], {"game": ""}).fetchall()
+        assert len(rows) == 100
+        assert [row[3] for row in rows] == sorted(
+            (row[3] for row in rows), reverse=True
+        )
+    finally:
+        connection.close()
+
+
+def test_team_schedule_performance_thresholds_on_local_snapshot():
+    """Team schedule remains within its warm-snapshot budgets with game filtering."""
+    metadata_path = Path(__file__).parent / "data" / "metadata.json"
+    database_path = Path(__file__).parent / "data" / "esports.db"
+    if not database_path.is_file():
+        pytest.skip("local esports.db snapshot is unavailable")
+    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]["team_schedule"]["sql"]
+    connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    try:
+        workloads = (
+            ({"team": "Liquid", "game": ""}, 250),
+            ({"team": "", "game": ""}, 500),
+            ({"team": "", "game": "Counter-Strike"}, 500),
+        )
+        for params, threshold_ms in workloads:
+            durations = []
+            rows = []
+            for _ in range(5):
+                started = perf_counter()
+                rows = connection.execute(query, params).fetchall()
+                durations.append((perf_counter() - started) * 1000)
+            assert len(rows) <= 100
+            assert median(durations) < threshold_ms
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":
