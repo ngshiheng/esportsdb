@@ -19,6 +19,7 @@ flowchart TD
     end
 
     ART[("GitHub Artifact<br>esports.db")]
+    DH[("Docker Hub<br>ngshiheng/esportsdb")]
     RW["Railway<br>Datasette"]
     USER(["User"])
 
@@ -34,20 +35,23 @@ flowchart TD
     F -->|"upload on success"| ART
     B -->|"upload on success"| ART
 
-    S -->|"redeploy"| RW
-    F -->|"redeploy"| RW
+    S -->|"build + push after validation"| DH
+    F -->|"build + push after validation"| DH
+
+    S -->|"redeploy after image publish"| RW
+    F -->|"redeploy after image publish"| RW
 
     USER -->|"SQL / Datasette UI"| RW
 ```
 
-All three workflows share the **`esportsdb-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex - only one job holds the artifact lock at a time; others queue and wait.
+All three workflows share the **`esports-db-artifact` concurrency group** (`cancel-in-progress: false`). This acts as a mutex - only one job holds the artifact lock at a time; others queue and wait. Fast and slow workflows publish a Datasette image and redeploy Railway only after the refreshed database passes validation; the fast workflow does so on every successful two-hour refresh.
 
 ## CI Workflows
 
 | Workflow             | Schedule                 | Resources                                                            | Purpose                                                                               |
 | -------------------- | ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `scrape-slow.yml`    | Daily 02:00 UTC          | `videogames`, `leagues`, `series`, `tournaments`, `teams`, `players` | Full daily rescrape of all non-match reference tables; Docker publish; Railway deploy |
-| `scrape-fast.yml`    | Every 2 hours            | `*_upcoming`, `*_running`, `teams`                                   | Refresh upcoming/live matches and team data; Railway deploy                           |
+| `scrape-fast.yml`    | Every 2 hours            | `*_upcoming`, `*_running`, `teams`                                   | Refresh upcoming/live matches and team data; build/push Datasette image; Railway deploy |
 | `scrape-history.yml` | `workflow_dispatch` only | `matches` (no filter)                                                | One-shot full historical matches backfill (~253K rows, ~2.5 h)                        |
 | `test.yml`           | Every push / PR          | -                                                                    | Run unit tests                                                                        |
 
@@ -169,8 +173,8 @@ The scheduled fast and slow workflows validate the candidate database with SQLit
 | Secret                   | Used by                                               |
 | ------------------------ | ----------------------------------------------------- |
 | `PANDASCORE_API_KEY`     | All scrape jobs                                       |
-| `DOCKERHUB_TOKEN`        | `scrape-slow.yml` - Docker image publish              |
-| `RAILWAY_TOKEN`          | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
-| `RAILWAY_PROJECT_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
-| `RAILWAY_ENVIRONMENT_ID` | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
-| `RAILWAY_SERVICE_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy |
+| `DOCKERHUB_TOKEN`        | `scrape-fast.yml`, `scrape-slow.yml` - Docker image publish |
+| `RAILWAY_TOKEN`          | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy       |
+| `RAILWAY_PROJECT_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy       |
+| `RAILWAY_ENVIRONMENT_ID` | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy       |
+| `RAILWAY_SERVICE_ID`     | `scrape-fast.yml`, `scrape-slow.yml` - Railway deploy       |
