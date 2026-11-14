@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "hishel>=1.2",
+#   "hishel>=1.2,<2.0.0",
 #   "httpx>=0.27",
 #   "tenacity>=9.0",
 #   "typer>=0.12",
@@ -187,7 +187,6 @@ class RowRejection:
 
 
 @dataclass(frozen=True)
-
 class ResourceOutcome:
     """Final source-record accounting for one configured resource."""
 
@@ -208,7 +207,9 @@ class ResourceOutcome:
             "rejected": self.rejected,
             "rejection_rate": self.rejection_rate,
             "rejection_reasons": self.rejection_reasons,
-            "rejection_examples": [asdict(rejection) for rejection in self.rejection_examples],
+            "rejection_examples": [
+                asdict(rejection) for rejection in self.rejection_examples
+            ],
         }
 
 
@@ -231,7 +232,9 @@ class ScrapeResult:
     persisted_ids: tuple[int | str, ...] = ()
     rejected_ids: tuple[int | str, ...] = ()
     rejection_reasons_by_id: dict[int | str, str] = field(default_factory=dict)
-    relationship_rejection_keys: tuple[tuple[int | str | None, int | str, str, str], ...] = ()
+    relationship_rejection_keys: tuple[
+        tuple[int | str | None, int | str, str, str], ...
+    ] = ()
     relationship_rejection_reasons: dict[str, int] = field(default_factory=dict)
 
 
@@ -560,9 +563,7 @@ class Database:
                 for row in self._connection.execute(f"PRAGMA table_info({table})")
             }
             for column in columns & existing_columns:
-                self._connection.execute(
-                    f"ALTER TABLE {table} DROP COLUMN {column}"
-                )
+                self._connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
     def upsert(self, table: str, row: dict[str, Any]) -> None:
         columns = tuple(row)
@@ -637,9 +638,13 @@ class Database:
         }
         for field_name, parent_table in parent_fields.get(table, ()):
             parent_id = row.get(field_name)
-            if parent_id is not None and self._connection.execute(
-                f"SELECT 1 FROM {parent_table} WHERE id = ?", (parent_id,)
-            ).fetchone() is None:
+            if (
+                parent_id is not None
+                and self._connection.execute(
+                    f"SELECT 1 FROM {parent_table} WHERE id = ?", (parent_id,)
+                ).fetchone()
+                is None
+            ):
                 return parent_table, parent_id
         return None
 
@@ -783,7 +788,9 @@ def _selected_stream_raw_url(record: dict[str, Any]) -> str | None:
                 return raw_url
         return None
 
-    url = first_url(lambda stream: stream.get("main") is True and stream.get("official") is True)
+    url = first_url(
+        lambda stream: stream.get("main") is True and stream.get("official") is True
+    )
     if url is not None:
         return url
     url = first_url(lambda stream: stream.get("official") is True)
@@ -957,7 +964,9 @@ def scrape_resource(
     records_to_retry: list[dict[str, Any]] = []
     row_rejections: list[RowRejection] = []
     relationship_rejections: list[RowRejection] = []
-    relationship_rejection_keys: set[tuple[int | str | None, int | str, str, str]] = set()
+    relationship_rejection_keys: set[tuple[int | str | None, int | str, str, str]] = (
+        set()
+    )
     relationship_rejection_reasons: Counter[str] = Counter()
     rejection_reasons_by_id: dict[int | str, str] = {}
     attempted_ids: set[int | str] = set()
@@ -1048,7 +1057,12 @@ def scrape_resource(
                         rejection.detail,
                     )
                 relationship_rejection_keys.add(
-                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                    (
+                        record_id,
+                        extra_row["opponent_id"],
+                        normalized_type,
+                        rejection.reason,
+                    )
                 )
                 relationship_rejection_reasons[rejection.reason] += 1
                 continue
@@ -1072,7 +1086,12 @@ def scrape_resource(
                         rejection.detail,
                     )
                 relationship_rejection_keys.add(
-                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                    (
+                        record_id,
+                        extra_row["opponent_id"],
+                        normalized_type,
+                        rejection.reason,
+                    )
                 )
                 relationship_rejection_reasons[rejection.reason] += 1
                 continue
@@ -1109,7 +1128,12 @@ def scrape_resource(
                         rejection.detail,
                     )
                 relationship_rejection_keys.add(
-                    (record_id, extra_row["opponent_id"], normalized_type, rejection.reason)
+                    (
+                        record_id,
+                        extra_row["opponent_id"],
+                        normalized_type,
+                        rejection.reason,
+                    )
                 )
                 relationship_rejection_reasons[rejection.reason] += 1
                 if not skip_fk_errors:
@@ -1277,7 +1301,8 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
             outcomes[resource] = ResourceOutcome(
                 attempted=result.unique_attempted or result.attempted,
                 persisted=len(result.persisted_ids) or result.persisted,
-                rejected=len(result.rejected_ids) or len({r.record_id for r in result.row_rejections}),
+                rejected=len(result.rejected_ids)
+                or len({r.record_id for r in result.row_rejections}),
                 rejection_reasons=(
                     dict(Counter(result.rejection_reasons_by_id.values()))
                     if result.rejection_reasons_by_id
@@ -1305,12 +1330,19 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
                     *unique_relationships.values(),
                 ),
                 "rejection_examples": [
-                    asdict(r) for r in result.relationship_rejections[:MAX_REJECTION_EXAMPLES]
+                    asdict(r)
+                    for r in result.relationship_rejections[:MAX_REJECTION_EXAMPLES]
                 ],
                 "missing_opponents": result.missing_opponents,
-                "unsupported_opponents": prior_relationships.get("unsupported_opponents", 0) + sum(
+                "unsupported_opponents": prior_relationships.get(
+                    "unsupported_opponents", 0
+                )
+                + sum(
                     r.reason == "unsupported_opponent_type"
-                    for r in (*prior_relationships.get("rejection_objects", ()), *result.relationship_rejections)
+                    for r in (
+                        *prior_relationships.get("rejection_objects", ()),
+                        *result.relationship_rejections,
+                    )
                 ),
             }
             return result
@@ -1356,7 +1388,9 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
             attempted = len(attempted_ids) or first_result.attempted
             persisted_ids = set(first_result.persisted_ids)
             persisted_ids.update(retry_result.persisted_ids)
-            persisted = len(persisted_ids) or (previous.persisted + retry_result.persisted)
+            persisted = len(persisted_ids) or (
+                previous.persisted + retry_result.persisted
+            )
             outcomes[resource] = ResourceOutcome(
                 attempted=attempted,
                 persisted=persisted,
@@ -1370,10 +1404,14 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
                     if final_rejection_reasons
                     else dict(Counter(r.reason for r in final_rejections.values()))
                 ),
-                rejection_examples=tuple(final_rejections.values())[:MAX_REJECTION_EXAMPLES],
+                rejection_examples=tuple(final_rejections.values())[
+                    :MAX_REJECTION_EXAMPLES
+                ],
             )
             relationship_rejections = retry_result.relationship_rejections
-            prior_relationship_objects = relationships[resource].get("rejection_objects", ())
+            prior_relationship_objects = relationships[resource].get(
+                "rejection_objects", ()
+            )
             combined_relationships = tuple(
                 {
                     (r.record_id, r.parent_type, r.parent_id, r.reason): r
@@ -1444,7 +1482,10 @@ def run_scrape(config: ScraperConfig, outcome_path: Path | None = None) -> int:
             outcome_path.write_text(
                 json.dumps(
                     {
-                        "resources": {name: outcome.to_json() for name, outcome in outcomes.items()},
+                        "resources": {
+                            name: outcome.to_json()
+                            for name, outcome in outcomes.items()
+                        },
                         "relationships": public_relationships,
                         "threshold": MAX_REJECTION_RATE,
                         "threshold_exceeded": bool(threshold_failures),
