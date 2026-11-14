@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "hishel>=1.2",
+#   "hishel>=1.2,<2.0",
 #   "httpx>=0.27",
 #   "tenacity>=9.0",
 #   "typer>=0.12",
@@ -48,9 +48,31 @@ def _metadata_fixture_connection():
         [
             (1, "Test Cup", "2020-01-01", "2020-01-02", 1, 1, 1, "s", 1, "Team"),
             (2, "Other Cup", "2020-01-01", "2020-01-02", 2, 2, 2, "a", 2, "Team"),
-            (3, "No Series Completed", "2020-02-01", "2020-02-02", None, 1, 1, "s", None, None),
+            (
+                3,
+                "No Series Completed",
+                "2020-02-01",
+                "2020-02-02",
+                None,
+                1,
+                1,
+                "s",
+                None,
+                None,
+            ),
             (4, "No Series Ongoing", None, None, None, 1, 1, "b", None, None),
-            (5, "No Series Upcoming", "2099-01-01", "2099-01-02", None, 1, 1, "c", None, None),
+            (
+                5,
+                "No Series Upcoming",
+                "2099-01-01",
+                "2099-01-02",
+                None,
+                1,
+                1,
+                "c",
+                None,
+                None,
+            ),
         ],
     )
     connection.execute(
@@ -68,8 +90,11 @@ def _metadata_fixture_connection():
     connection.executemany(
         "INSERT INTO players(id, name, active, current_team_id, current_videogame_id) "
         "VALUES (?, ?, ?, ?, ?)",
-        [(1, "Active Player", 1, 1, 1), (2, "Inactive Player", 0, 1, 1),
-         (3, "Other Player", 1, 3, 2)],
+        [
+            (1, "Active Player", 1, 1, 1),
+            (2, "Inactive Player", 0, 1, 1),
+            (3, "Other Player", 1, 3, 2),
+        ],
     )
     connection.executemany(
         "INSERT INTO matches(id, name, tournament_id, serie_id, league_id, videogame_id, "
@@ -78,9 +103,42 @@ def _metadata_fixture_connection():
         [
             (1, "Test Live", 1, 1, 1, 1, "running", "2025-01-01", "2025-01-01", None),
             (2, "Test Upcoming", 1, 1, 1, 1, "not_started", "2099-01-01", None, None),
-            (3, "Test Finished", 1, 1, 1, 1, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
-            (4, "Other Finished", 2, 2, 2, 2, "finished", "2020-01-02", "2020-01-02", "2020-01-02"),
-            (5, "No Series Finished", 3, None, 1, 1, "finished", "2020-02-02", "2020-02-02", "2020-02-02"),
+            (
+                3,
+                "Test Finished",
+                1,
+                1,
+                1,
+                1,
+                "finished",
+                "2020-01-02",
+                "2020-01-02",
+                "2020-01-02",
+            ),
+            (
+                4,
+                "Other Finished",
+                2,
+                2,
+                2,
+                2,
+                "finished",
+                "2020-01-02",
+                "2020-01-02",
+                "2020-01-02",
+            ),
+            (
+                5,
+                "No Series Finished",
+                3,
+                None,
+                1,
+                1,
+                "finished",
+                "2020-02-02",
+                "2020-02-02",
+                "2020-02-02",
+            ),
         ],
     )
     connection.execute(
@@ -90,8 +148,16 @@ def _metadata_fixture_connection():
     connection.executemany(
         "INSERT INTO match_opponents(match_id, opponent_id, opponent_type, score, is_winner) "
         "VALUES (?, ?, 'Team', ?, ?)",
-        [(1, 1, 1, 1), (1, 2, 0, 0), (2, 1, None, None), (2, 2, None, None),
-         (3, 1, 2, 0), (3, 2, 3, 1), (4, 2, 2, 1), (4, 3, 1, 0)],
+        [
+            (1, 1, 1, 1),
+            (1, 2, 0, 0),
+            (2, 1, None, None),
+            (2, 2, None, None),
+            (3, 1, 2, 0),
+            (3, 2, 3, 1),
+            (4, 2, 2, 1),
+            (4, 3, 1, 0),
+        ],
     )
     return connection
 
@@ -523,9 +589,7 @@ def test_ensure_schema_migrates_legacy_columns_and_is_repeatable(tmp_path):
     db.ensure_schema()
 
     columns = {
-        table: {
-            row[1] for row in db._connection.execute(f"PRAGMA table_info({table})")
-        }
+        table: {row[1] for row in db._connection.execute(f"PRAGMA table_info({table})")}
         for table in ("matches", "tournaments")
     }
     db.close()
@@ -583,16 +647,28 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
     db._connection.execute("ALTER TABLE matches ADD COLUMN complete INTEGER")
     db._connection.execute("ALTER TABLE tournaments ADD COLUMN full_name TEXT")
     db._connection.execute("UPDATE matches SET complete = 1 WHERE id = 5")
-    db._connection.execute("UPDATE tournaments SET full_name = 'obsolete value' WHERE id = 4")
+    db._connection.execute(
+        "UPDATE tournaments SET full_name = 'obsolete value' WHERE id = 4"
+    )
     db.commit()
 
     db.ensure_schema()
 
     counts = {
         table: db._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in ("videogames", "leagues", "series", "tournaments", "matches", "teams", "match_opponents")
+        for table in (
+            "videogames",
+            "leagues",
+            "series",
+            "tournaments",
+            "matches",
+            "teams",
+            "match_opponents",
+        )
     }
-    foreign_key_violations = db._connection.execute("PRAGMA foreign_key_check").fetchall()
+    foreign_key_violations = db._connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall()
     migrated_url = db._connection.execute(
         "SELECT streams_raw_url FROM matches WHERE id = 5"
     ).fetchone()[0]
@@ -611,7 +687,9 @@ def test_ensure_schema_preserves_rows_and_relationships_when_migrating(tmp_path)
     assert migrated_url == "https://www.twitch.tv/legacy"
 
 
-def test_ensure_schema_rejects_conflicting_stream_url_columns_without_data_loss(tmp_path):
+def test_ensure_schema_rejects_conflicting_stream_url_columns_without_data_loss(
+    tmp_path,
+):
     db = scrape.Database(tmp_path / "conflicting.db")
     db.ensure_schema()
     db._connection.execute("ALTER TABLE matches ADD COLUMN live_embed_url TEXT")
@@ -621,7 +699,9 @@ def test_ensure_schema_rejects_conflicting_stream_url_columns_without_data_loss(
     )
     db.commit()
 
-    with pytest.raises(sqlite3.DatabaseError, match="both live_embed_url and streams_raw_url"):
+    with pytest.raises(
+        sqlite3.DatabaseError, match="both live_embed_url and streams_raw_url"
+    ):
         db.ensure_schema()
 
     values = db._connection.execute(
@@ -788,16 +868,19 @@ def test_scrape_resource_keeps_valid_rows_and_reports_missing_parent(tmp_path):
             skip_fk_errors=True,
         )
 
-    saved = db._connection.execute(
-        "SELECT id FROM tournaments ORDER BY id"
-    ).fetchall()
+    saved = db._connection.execute("SELECT id FROM tournaments ORDER BY id").fetchall()
     db.close()
     assert saved == [(10,)]
     assert result.attempted == 2
     assert result.persisted == 1
     assert result.row_rejections == (
         scrape.RowRejection(
-            "tournaments/upcoming", 11, "missing_parent", "missing series parent id=999", "series", 999
+            "tournaments/upcoming",
+            11,
+            "missing_parent",
+            "missing series parent id=999",
+            "series",
+            999,
         ),
     )
 
@@ -805,7 +888,9 @@ def test_scrape_resource_keeps_valid_rows_and_reports_missing_parent(tmp_path):
 def test_scrape_resource_keeps_rejection_metrics_bounded():
     client = make_client()
     mock_db = MagicMock()
-    mock_db.upsert.side_effect = [sqlite3.IntegrityError("invalid row") for _ in range(105)]
+    mock_db.upsert.side_effect = [
+        sqlite3.IntegrityError("invalid row") for _ in range(105)
+    ]
     records = [{"id": i} for i in range(105)]
 
     with patch.object(client, "fetch_all", return_value=iter([records])):
@@ -872,7 +957,9 @@ def test_resource_rejection_threshold_is_strictly_greater_than_half(
         rejection_examples=(),
     )
 
-    assert ((outcome.rejection_rate or 0.0) > scrape.MAX_REJECTION_RATE) is expected_failure
+    assert (
+        (outcome.rejection_rate or 0.0) > scrape.MAX_REJECTION_RATE
+    ) is expected_failure
 
 
 def test_zero_attempt_resource_has_no_rejection_rate():
@@ -969,7 +1056,9 @@ def test_validate_database_rejects_unresolved_scrape_outcome(tmp_path):
     result = scrape.validate_database(db_path, outcome_path)
 
     assert result.valid is False
-    assert any("exceeded per-resource rejection threshold" in issue for issue in result.issues)
+    assert any(
+        "exceeded per-resource rejection threshold" in issue for issue in result.issues
+    )
 
 
 def test_fetch_all_live_request_sleeps_between_full_pages():
@@ -1076,7 +1165,9 @@ def test_scrape_resource_calls_extra_rows_fn_and_upserts_junction_rows():
     assert tables_upserted == ["matches", "match_opponents"]
 
 
-def test_run_scrape_retries_fk_rejected_record_without_refreshing_parent_catalogs(tmp_path):
+def test_run_scrape_retries_fk_rejected_record_without_refreshing_parent_catalogs(
+    tmp_path,
+):
     player = {
         "id": 4,
         "name": "player",
@@ -1098,7 +1189,9 @@ def test_run_scrape_retries_fk_rejected_record_without_refreshing_parent_catalog
         unresolved_relationships=1,
         records_to_retry=(player,),
         row_rejections=(
-            scrape.RowRejection("players", 4, "missing_parent", "missing teams parent id=9", "teams", 9),
+            scrape.RowRejection(
+                "players", 4, "missing_parent", "missing teams parent id=9", "teams", 9
+            ),
         ),
         attempted_ids=(4,),
     )
@@ -1250,28 +1343,61 @@ def test_tournament_to_row_omits_unsupported_full_name():
     [
         (
             [
-                {"main": False, "official": True, "raw_url": "https://example.com/official"},
-                {"main": True, "official": True, "raw_url": "https://example.com/main-official"},
-                {"main": True, "official": True, "raw_url": "https://example.com/second-main-official"},
+                {
+                    "main": False,
+                    "official": True,
+                    "raw_url": "https://example.com/official",
+                },
+                {
+                    "main": True,
+                    "official": True,
+                    "raw_url": "https://example.com/main-official",
+                },
+                {
+                    "main": True,
+                    "official": True,
+                    "raw_url": "https://example.com/second-main-official",
+                },
             ],
             "https://example.com/main-official",
         ),
         (
             [
                 {"main": True, "official": True, "raw_url": "  "},
-                {"main": False, "official": True, "raw_url": "https://example.com/official"},
-                {"main": True, "official": False, "raw_url": "https://example.com/main"},
+                {
+                    "main": False,
+                    "official": True,
+                    "raw_url": "https://example.com/official",
+                },
+                {
+                    "main": True,
+                    "official": False,
+                    "raw_url": "https://example.com/main",
+                },
             ],
             "https://example.com/official",
         ),
         (
             [
                 {"main": True, "official": True, "raw_url": None},
-                {"main": True, "official": False, "raw_url": "https://example.com/main"},
+                {
+                    "main": True,
+                    "official": False,
+                    "raw_url": "https://example.com/main",
+                },
             ],
             "https://example.com/main",
         ),
-        ([{"main": False, "official": False, "raw_url": "https://example.com/neither"}], None),
+        (
+            [
+                {
+                    "main": False,
+                    "official": False,
+                    "raw_url": "https://example.com/neither",
+                }
+            ],
+            None,
+        ),
         ([{"main": True, "official": True, "raw_url": ""}], None),
         ([], None),
         (None, None),
@@ -1359,21 +1485,35 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
     connection = _metadata_fixture_connection()
     try:
         roster_query = queries["team_roster"]["sql"]
-        roster_all = connection.execute(roster_query, {"game": "", "team": ""}).fetchall()
+        roster_all = connection.execute(
+            roster_query, {"game": "", "team": ""}
+        ).fetchall()
         assert [row[3] for row in roster_all] == ["Active Player", "Other Player"]
         assert len(roster_all) <= 100
-        assert [row[3] for row in connection.execute(
-            roster_query, {"game": "Test Game", "team": ""}
-        ).fetchall()] == ["Active Player"]
-        assert [row[3] for row in connection.execute(
-            roster_query, {"game": "", "team": "Other"}
-        ).fetchall()] == ["Other Player"]
-        assert [row[3] for row in connection.execute(
-            roster_query, {"game": "Other Game", "team": "Other"}
-        ).fetchall()] == ["Other Player"]
-        assert connection.execute(
-            roster_query, {"game": "Missing Game", "team": ""}
-        ).fetchall() == []
+        assert [
+            row[3]
+            for row in connection.execute(
+                roster_query, {"game": "Test Game", "team": ""}
+            ).fetchall()
+        ] == ["Active Player"]
+        assert [
+            row[3]
+            for row in connection.execute(
+                roster_query, {"game": "", "team": "Other"}
+            ).fetchall()
+        ] == ["Other Player"]
+        assert [
+            row[3]
+            for row in connection.execute(
+                roster_query, {"game": "Other Game", "team": "Other"}
+            ).fetchall()
+        ] == ["Other Player"]
+        assert (
+            connection.execute(
+                roster_query, {"game": "Missing Game", "team": ""}
+            ).fetchall()
+            == []
+        )
 
         schedule_query = queries["team_schedule"]["sql"]
         schedule_cursor = connection.execute(
@@ -1384,9 +1524,15 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
         stream_url_index = schedule_columns.index("streams_raw_url")
         schedule_all = schedule_cursor.fetchall()
         assert len(schedule_all) == 4
-        scheduled_with_url = next(row for row in schedule_all if row[match_id_index] == 2)
-        scheduled_without_url = next(row for row in schedule_all if row[match_id_index] == 1)
-        assert scheduled_with_url[stream_url_index] == "https://www.twitch.tv/test-stream"
+        scheduled_with_url = next(
+            row for row in schedule_all if row[match_id_index] == 2
+        )
+        scheduled_without_url = next(
+            row for row in schedule_all if row[match_id_index] == 1
+        )
+        assert (
+            scheduled_with_url[stream_url_index] == "https://www.twitch.tv/test-stream"
+        )
         assert scheduled_without_url[stream_url_index] is None
         assert len(schedule_all) <= 100
         game_schedule = connection.execute(
@@ -1401,9 +1547,12 @@ def test_team_queries_return_bounded_defaults_and_apply_partial_filters():
             schedule_query, {"game": "Test Game", "team": "Test Team", "league": ""}
         ).fetchall()
         assert {row[match_id_index] for row in combined_schedule} == {1, 2, 3}
-        assert connection.execute(
-            schedule_query, {"game": "Missing Game", "team": "", "league": ""}
-        ).fetchall() == []
+        assert (
+            connection.execute(
+                schedule_query, {"game": "Missing Game", "team": "", "league": ""}
+            ).fetchall()
+            == []
+        )
         league_schedule = connection.execute(
             schedule_query, {"game": "", "team": "", "league": "Test League"}
         ).fetchall()
@@ -1427,35 +1576,60 @@ def test_match_lifecycle_filters_narrow_results_and_blank_values_broaden_them():
             completed_query, {"game": "", "tier": "", "league": ""}
         ).fetchall()
         assert len(all_completed) == 3
-        assert len(connection.execute(
-            completed_query, {"game": "Test Game", "tier": "", "league": ""}
-        ).fetchall()) == 2
-        assert len(connection.execute(
-            completed_query, {"game": "", "tier": "s", "league": ""}
-        ).fetchall()) == 2
-        assert len(connection.execute(
-            completed_query, {"game": "", "tier": "", "league": "Test"}
-        ).fetchall()) == 2
-        assert connection.execute(
-            completed_query, {"game": "", "tier": "", "league": "Missing"}
-        ).fetchall() == []
+        assert (
+            len(
+                connection.execute(
+                    completed_query, {"game": "Test Game", "tier": "", "league": ""}
+                ).fetchall()
+            )
+            == 2
+        )
+        assert (
+            len(
+                connection.execute(
+                    completed_query, {"game": "", "tier": "s", "league": ""}
+                ).fetchall()
+            )
+            == 2
+        )
+        assert (
+            len(
+                connection.execute(
+                    completed_query, {"game": "", "tier": "", "league": "Test"}
+                ).fetchall()
+            )
+            == 2
+        )
+        assert (
+            connection.execute(
+                completed_query, {"game": "", "tier": "", "league": "Missing"}
+            ).fetchall()
+            == []
+        )
 
         live_params = {"game": "", "tier": "", "league": ""}
         live_cursor = connection.execute(queries["live_matches"]["sql"], live_params)
         assert len(live_cursor.fetchall()) == 1
         assert "streams_raw_url" in [column[0] for column in live_cursor.description]
-        assert connection.execute(
-            queries["live_matches"]["sql"],
-            {"game": "", "tier": "", "league": "Missing"},
-        ).fetchall() == []
+        assert (
+            connection.execute(
+                queries["live_matches"]["sql"],
+                {"game": "", "tier": "", "league": "Missing"},
+            ).fetchall()
+            == []
+        )
         upcoming_params = {"game": "", "tier": "", "league": ""}
         upcoming_cursor = connection.execute(
             queries["upcoming_matches"]["sql"], upcoming_params
         )
         upcoming_columns = [column[0] for column in upcoming_cursor.description]
-        upcoming_rows = [dict(zip(upcoming_columns, row)) for row in upcoming_cursor.fetchall()]
+        upcoming_rows = [
+            dict(zip(upcoming_columns, row)) for row in upcoming_cursor.fetchall()
+        ]
         assert len(upcoming_rows) == 1
-        assert upcoming_rows[0]["streams_raw_url"] == "https://www.twitch.tv/test-stream"
+        assert (
+            upcoming_rows[0]["streams_raw_url"] == "https://www.twitch.tv/test-stream"
+        )
         filtered_upcoming_rows = connection.execute(
             queries["upcoming_matches"]["sql"],
             {"game": "", "tier": "", "league": "Other"},
@@ -1492,15 +1666,22 @@ def test_tournament_query_context_order_and_lifecycle_descriptions():
         major_rows = connection.execute(
             queries["major_events"]["sql"], {"game": "", "league": ""}
         ).fetchall()
-        assert any(row[2] == "Test Series Full Name" and row[3] == "Test Cup" for row in major_rows)
-        assert any(row[2] is None and row[3] == "No Series Completed" for row in major_rows)
+        assert any(
+            row[2] == "Test Series Full Name" and row[3] == "Test Cup"
+            for row in major_rows
+        )
+        assert any(
+            row[2] is None and row[3] == "No Series Completed" for row in major_rows
+        )
 
         ongoing = queries["ongoing_tournaments"]
         assert ongoing["title"] == "Ongoing Tournaments"
         ongoing_rows = connection.execute(
             ongoing["sql"], {"game": "", "tier": "", "league": ""}
         ).fetchall()
-        assert any(row[3] == "No Series Ongoing" and row[2] is None for row in ongoing_rows)
+        assert any(
+            row[3] == "No Series Ongoing" and row[2] is None for row in ongoing_rows
+        )
         assert "dates" in ongoing["description"].lower()
         assert "separate from whether any match is live" in ongoing["description"]
         assert "datetime('now')" in ongoing["sql"]
@@ -1509,12 +1690,16 @@ def test_tournament_query_context_order_and_lifecycle_descriptions():
             queries["upcoming_tournaments"]["sql"],
             {"game": "", "tier": "", "league": ""},
         ).fetchall()
-        assert any(row[3] == "No Series Upcoming" and row[2] is None for row in upcoming_rows)
+        assert any(
+            row[3] == "No Series Upcoming" and row[2] is None for row in upcoming_rows
+        )
         completed_rows = connection.execute(
             queries["completed_tournaments"]["sql"],
             {"game": "", "tier": "", "league": ""},
         ).fetchall()
-        assert any(row[3] == "No Series Completed" and row[2] is None for row in completed_rows)
+        assert any(
+            row[3] == "No Series Completed" and row[2] is None for row in completed_rows
+        )
 
         event_query_counts = {
             "major_events": 2,
@@ -1526,12 +1711,20 @@ def test_tournament_query_context_order_and_lifecycle_descriptions():
             query = queries[query_name]
             assert "league" in query["params"]
             assert "League" in query["description"]
-            assert len(connection.execute(
-                query["sql"], {"game": "", "tier": "", "league": "Test"}
-            ).fetchall()) == expected_count
-            assert connection.execute(
-                query["sql"], {"game": "", "tier": "", "league": "Missing"}
-            ).fetchall() == []
+            assert (
+                len(
+                    connection.execute(
+                        query["sql"], {"game": "", "tier": "", "league": "Test"}
+                    ).fetchall()
+                )
+                == expected_count
+            )
+            assert (
+                connection.execute(
+                    query["sql"], {"game": "", "tier": "", "league": "Missing"}
+                ).fetchall()
+                == []
+            )
 
         live = queries["live_matches"]
         assert live["title"] == "Live Matches"
@@ -1562,10 +1755,14 @@ def test_match_query_context_order_full_names_and_missing_series():
             assert columns[:4] == expected_columns
             if query_name == "completed_matches":
                 rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-                missing_series = next(row for row in rows if row["match_name"] == "No Series Finished")
+                missing_series = next(
+                    row for row in rows if row["match_name"] == "No Series Finished"
+                )
                 assert missing_series["series"] is None
                 assert missing_series["tournament"] == "No Series Completed"
-                missing_full_name = next(row for row in rows if row["match_name"] == "Other Finished")
+                missing_full_name = next(
+                    row for row in rows if row["match_name"] == "Other Finished"
+                )
                 assert missing_full_name["series"] is None
             elif query_name == "live_matches":
                 rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -1580,7 +1777,9 @@ def test_match_query_context_order_full_names_and_missing_series():
 
         live = queries["live_matches"]
         assert "status is marked running" in live["description"].lower()
-        assert "different from a tournament being ongoing" in live["description"].lower()
+        assert (
+            "different from a tournament being ongoing" in live["description"].lower()
+        )
         assert "m.status = 'running'" in live["sql"]
     finally:
         connection.close()
@@ -1591,7 +1790,9 @@ def test_leagues_by_game_all_games_default_is_bounded_and_ordered():
     database_path = Path(__file__).parent / "data" / "esports.db"
     if not database_path.is_file():
         pytest.skip("local esports.db snapshot is unavailable")
-    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]["leagues_by_game"]
+    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"][
+        "leagues_by_game"
+    ]
     connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
     try:
         rows = connection.execute(query["sql"], {"game": ""}).fetchall()
@@ -1609,7 +1810,9 @@ def test_team_schedule_performance_thresholds_on_local_snapshot():
     database_path = Path(__file__).parent / "data" / "esports.db"
     if not database_path.is_file():
         pytest.skip("local esports.db snapshot is unavailable")
-    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"]["team_schedule"]["sql"]
+    query = json.loads(metadata_path.read_text())["databases"]["esports"]["queries"][
+        "team_schedule"
+    ]["sql"]
     connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
     try:
         workloads = (

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "hishel>=1.2,<2.0.0",
+#   "hishel>=1.2,<2.0",
 #   "httpx>=0.27",
 #   "tenacity>=9.0",
 #   "typer>=0.12",
